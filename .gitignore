@@ -57,3 +57,6 @@ $RECYCLE.BIN/
 *.partial.wav
 *.tmp
 *_denoised.wav
+
+# --- Local-only design notes and project memory --------------------------
+notes/

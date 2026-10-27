@@ -117,10 +117,21 @@ AudioDeNoiser/
 ├── audio_denoiser.py       # Desktop GUI and DSP pipeline
 ├── AudioDeNoiser.bat       # Environment bootstrapper and launcher
 ├── settings.example.json   # Settings template
-├── notes/01_Active/        # Design notes
+├── ROADMAP.md              # Scope of planned work
+├── CHANGELOG.md            # Release history
 ├── LICENSE                 # Proprietary licence
 └── README.md
 ```
+
+## Releases
+
+Builds and release notes are published on the [Releases page](https://github.com/hawkers63/AudioDeNoiser/releases).
+
+| Version | Date | Summary |
+| --- | --- | --- |
+| [1.0.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.0.0) | 27 October 2026 | First release: DeepFilterNet 3 restoration, rumble filter, chunked processing, A/B auditioning and 24-bit output |
+
+See [`CHANGELOG.md`](CHANGELOG.md) for full details and [`ROADMAP.md`](ROADMAP.md) for what's planned next.
 
 ## Legal and copyright notice
 
