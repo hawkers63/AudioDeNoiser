@@ -1,0 +1,59 @@
+# AudioDeNoiser .gitignore
+# Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
+
+# --- Runtime settings, local overrides and logs ---------------------------
+settings.json
+config.json
+*.log
+error.log
+
+# --- Python artefacts -----------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+*.spec
+
+# --- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- PyTorch / DeepFilterNet caches and model downloads -------------------
+.cache/
+*.pt
+*.pth
+*.ckpt
+torch_cache/
+
+# --- Tooling caches -------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE and editor configuration -----------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*~
+
+# --- Windows OS cache files -----------------------------------------------
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- Audio processing temporaries ----------------------------------------
+*.partial.wav
+*.tmp
+*_denoised.wav

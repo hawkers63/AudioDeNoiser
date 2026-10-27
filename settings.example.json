@@ -1,0 +1,8 @@
+{
+  "output_dir": "D:\\Audio\\Denoised",
+  "atten_index": 9,
+  "highpass": "80 Hz",
+  "post_filter": false,
+  "normalise": true,
+  "last_dir": ""
+}

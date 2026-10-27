@@ -1,0 +1,65 @@
+AudioDeNoiser - Proprietary Software Licence
+All Rights Reserved
+
+Copyright (c) 2026-present Mark Hawksworth (GitHub: hawkers63).
+All rights reserved.
+
+1. Ownership
+   This software, including its source code, object code, documentation,
+   user interface designs, artwork and all associated files (together, the
+   "Software"), is the exclusive property of Mark Hawksworth ("the Owner")
+   and is protected by copyright law and international treaties. No
+   ownership rights are transferred by making the Software visible or
+   available to you.
+
+2. No Licence Granted
+   Except where the Owner has given prior written consent, no licence or
+   right is granted to any person to use the Software. Viewing the Software
+   on a public or private repository hosting service does not grant any
+   licence to it.
+
+3. Prohibited Acts
+   Without the Owner's prior written consent, you must not, in whole or in
+   part:
+   (a) copy, reproduce or download the Software, except as strictly
+       required by the hosting service's own terms for viewing it;
+   (b) distribute, publish, sell, rent, lease, lend or otherwise make the
+       Software available to any third party;
+   (c) modify, adapt, translate or create derivative works of the Software;
+   (d) reverse engineer, decompile, disassemble or otherwise attempt to
+       derive the source code, algorithms or structure of any compiled form
+       of the Software, except to the extent that such restriction is
+       expressly prohibited by applicable law;
+   (e) sublicense, assign or transfer any right in the Software;
+   (f) use the Software, or any part of it, for any commercial purpose or
+       to provide any service to third parties; or
+   (g) remove, alter or obscure any copyright notice, licence text or
+       other proprietary marking in the Software.
+
+4. Third-Party Components
+   The Software depends on third-party libraries (including PyTorch,
+   DeepFilterNet, NumPy, SciPy, soundfile, sounddevice and CustomTkinter),
+   which are not included in this repository and remain subject to their
+   own licences. This licence governs only the Owner's original work.
+
+5. Termination and Enforcement
+   Any use of the Software in breach of this licence is unauthorised and
+   may give rise to civil and criminal liability. The Owner reserves the
+   right to pursue all remedies available at law or in equity, including
+   injunctive relief and damages.
+
+6. Disclaimer of Warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+   IN NO EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS
+   USE.
+
+7. Governing Law
+   This licence is governed by the laws of England and Wales, and the
+   courts of England and Wales have exclusive jurisdiction over any
+   dispute arising from it.
+
+For permission requests, contact the Owner through GitHub:
+https://github.com/hawkers63
