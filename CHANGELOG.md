@@ -6,6 +6,21 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-28
+
+Manual, Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean are unchanged when Dialogue is left on Off, which is their default.
+
+### Added
+
+- **Conversation (1–5 m)**, for talk a few metres from the microphone. It keeps Pedestrian Street's 18 dB blend and its idle-tone notch, turns the post-filter off so quiet consonants are not stripped, ducks gusts only under 110 Hz (4 dB, and 1.5 dB while the fragment is voiced), and gates the steady floor from 2.2 kHz to 7 kHz by 6 dB, above the main vowel formants. Dialogue starts on Clear.
+- **Dialogue** menu: Off, Gentle (up to 3 dB) or Clear (up to 6 dB). After the model it lifts 1.8–4 kHz, and 4–6.5 kHz by half that amount, on voiced speech and on consonants within 80 ms of a vowel, and only where that band is darker than close speech. The vowel's body (300 Hz–1 kHz) is never boosted. A frame quieter than −50 dBFS is left alone, and a stretch of noise with no vowel nearby is left alone. If the boost would push the chunk past 0.99, only the added part is turned down. Off returns the samples untouched. The menu follows the scene, and the choice in front of you is what Denoise uses. Stored as `dialogue_lift` (`off`, `gentle` or `clear`). A missing key means the scene's own default.
+- The close-speech balance used by that lift is −23.0 dB of presence against body, measured on the Hazel text-to-speech clip (voiced-frame median −23.1 dB, rounded to 0.5 dB). The presence-floor bias is 1.2, measured on steady noise (the band's RMS was 1.225 times the tracked minimum, rounded to 0.1), so the floor sits on the noise rather than under it. These are not a listening result.
+- **Subtitles while playing**, off by default. Once the WAV is saved, the denoised audio is transcribed on this machine with wav2vec2-base, the model already included in torchaudio 2.1.2. No new package is installed. The words follow the playhead during playback. **Save text** writes `<name>_denoised.srt` and `<name>_denoised.txt` next to the WAV. The first run downloads the weights (MIT licence) to `D:\Audio\Models`, or to a `models` folder in the output directory if that drive cannot be used. There is no language model: no punctuation, no capitals, and names and street noise will be misspelt. The log says so the first time a transcript is made. Cancel during subtitles keeps the WAV and any lines already recognised. Stored as `subtitles` (missing means off). On this laptop, with the weights already on disk, the 18-second Hazel clip took 20 seconds, including loading the recogniser. Six of eight marker words came back (`kit` was heard as `kick`). That is a clean-voice smoke test, not an outdoor accuracy figure, and it is not a live microphone.
+
+### Changed
+
+- The window is 860×978, and the smallest size is 760×954, so the dialogue row, the subtitle line and the log all remain visible.
+
 ## [1.2.1] - 2026-10-28
 
 ### Changed
@@ -70,7 +85,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0

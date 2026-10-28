@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.2
+Audio DeNoiser 1.3
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -33,10 +33,13 @@ How the processing chain works
    model has settled before its output is used, joined with 0.25 s crossfades.
    Chunking gives a real progress bar, a working Cancel button and flat memory use.
    After the model, Heavy Wind and Highway soften isolated spectral peaks, and
-   Wind, Highway and Street lower the steady residual floor (the floor gate).
+   Wind, Highway, Street and Conversation lower the steady residual floor (the
+   floor gate). Conversation, and any scene whose Dialogue control is above Off,
+   then lifts the consonant band on voiced frames and on consonants beside a vowel.
 4. Resample back to the source rate, optionally peak-normalise, and save a WAV
    named <name>_denoised.wav at the source's bit depth (24-bit for MP3 and OGG).
 5. A/B playback can be loudness-matched (ITU-R BS.1770-4). The file is untouched.
+   With Subtitles on, a local transcript is shown under the waveform and can be saved.
 """
 from __future__ import annotations
 
@@ -66,7 +69,7 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import soundfile as sf
 from scipy.linalg import LinAlgError, solve_toeplitz, solveh_banded
-from scipy.ndimage import median_filter, minimum_filter1d, uniform_filter1d
+from scipy.ndimage import maximum_filter1d, median_filter, minimum_filter1d, uniform_filter1d
 from scipy import fft as sp_fft
 from scipy.signal import (butter, get_window, resample_poly, sosfilt, sosfilt_zi,
                           sosfiltfilt, stft)
@@ -86,7 +89,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -224,7 +227,52 @@ GATE_TRACK_S = 0.6              # longer than a held fricative or vowel
 GATE_BIAS = 3.6                 # minimum-to-RMS on Gaussian noise, for the three lines above
 GATE_OVERSUB = 1.6              # the gain is fully closed within 4 dB of the floor
 
+# Dialogue lift. Off (0 dB) returns the audio untouched. Gentle is 3 dB and
+# Clear is 6 dB, both caps on the presence band. The air band takes half.
+# DIALOGUE_TARGET_TILT_DB is the presence-minus-body balance of close speech
+# (Hazel TTS, dry, voiced-frame median −23.1 dB, rounded to 0.5 dB).
+# DIALOGUE_FLOOR_BIAS lifts the presence-band minimum up to its RMS
+# (Gaussian noise, median ratio 1.225, rounded to 0.1). See the note 005 review.
+DIALOGUE_FRAME = 1024
+DIALOGUE_HOP = 256
+DIALOGUE_BODY = (300.0, 1000.0)
+DIALOGUE_PRESENCE = (1800.0, 4000.0)
+DIALOGUE_AIR = (4000.0, 6500.0)
+DIALOGUE_TARGET_TILT_DB = -23.0
+DIALOGUE_AIR_SHARE = 0.5
+DIALOGUE_CONSONANT_MARGIN_DB = 6.0
+DIALOGUE_FLATNESS_MIN = 0.25
+DIALOGUE_VOICE_REACH_S = 0.080
+DIALOGUE_SILENCE_DBFS = -50.0   # time-domain frame RMS; a quiet consonant still passes
+DIALOGUE_FLOOR_BIAS = 1.2
+DIALOGUE_EDGE_BINS = 4
+DIALOGUE_CEILING = 0.99
+LIFT_GENTLE_DB = 3.0
+LIFT_CLEAR_DB = 6.0
+LIFT_CHOICES = {"Off": 0.0, "Gentle": LIFT_GENTLE_DB, "Clear": LIFT_CLEAR_DB}
+
+# Subtitles. The recogniser is wav2vec2-base, already in torchaudio 2.1.
+# Its convolutional front end strides by 5×2×2×2×2×2×2 = 320 samples at 16 kHz.
+ASR_CHUNK_S = 20.0
+ASR_OVERLAP_S = 1.0
+ASR_SR = 16_000
+CTC_STRIDE = 320
+CUE_MAX_CHARS = 42
+CUE_MAX_S = 6.0
+CUE_GAP_S = 0.8
+CUE_MIN_S = 1.0
+CUE_TAIL_S = 0.2
+
 _SOS_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def lift_label(lift_db: float) -> str:
+    """Menu label for a dialogue-lift cap in decibels."""
+    if lift_db <= 0.0:
+        return "Off"
+    if lift_db < (LIFT_GENTLE_DB + LIFT_CLEAR_DB) / 2.0:
+        return "Gentle"
+    return "Clear"
 
 
 @dataclass(frozen=True)
@@ -261,6 +309,7 @@ class ScenePreset:
     gate_db: float
     gate_lo_hz: float | None
     gate_hi_hz: float | None
+    lift_db: float
 
     @property
     def active(self) -> bool:
@@ -273,6 +322,10 @@ class ScenePreset:
     @property
     def uses_gate(self) -> bool:
         return self.gate_db > 0.0 and self.gate_lo_hz is not None and self.gate_hi_hz is not None
+
+    @property
+    def uses_lift(self) -> bool:
+        return self.lift_db > 0.0
 
 
 class ConditionerState:
@@ -1275,6 +1328,173 @@ def _gate_gain(
     return gain
 
 
+def _band_slice(n_bins: int, sr: int, frame: int, lo_hz: float, hi_hz: float) -> slice:
+    """Bins covering ``lo_hz`` to ``hi_hz``. DC is never included."""
+    if sr <= 0 or frame <= 0:
+        raise ValueError("Sample rate and frame length must be positive.")
+    bin_hz = sr / frame
+    first = max(1, int(math.floor(lo_hz / bin_hz)))
+    last = min(n_bins, int(math.ceil(hi_hz / bin_hz)) + 1)
+    if last - first < 2:
+        raise ValueError(
+            f"Band {lo_hz:g}–{hi_hz:g} Hz covers fewer than two bins at {sr} Hz."
+        )
+    return slice(first, last)
+
+
+def _cosine_fade(gain: np.ndarray, rows: slice, edge: int) -> None:
+    """Soften the ends of a boosted band back toward unity."""
+    width = rows.stop - rows.start
+    fade = min(edge, width // 2)
+    if fade <= 0:
+        return
+    ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, math.pi, fade, dtype=np.float64))
+    band = gain[rows]
+    band[:fade] = 1.0 + (band[:fade] - 1.0) * ramp[:, None]
+    band[-fade:] = 1.0 + (band[-fade:] - 1.0) * ramp[::-1, None]
+
+
+def _limit_lift(dry: np.ndarray, lifted: np.ndarray, ceiling: float = DIALOGUE_CEILING) -> np.ndarray:
+    """Scale the added part so the chunk peaks at ``ceiling``.
+
+    Where the lift gain was unity, ``lifted`` matches ``dry`` and the mix
+    stays there. A chunk that already peaks over the ceiling is returned
+    unchanged: the lift does not repair clipping it did not cause.
+    """
+    peak = float(np.max(np.abs(lifted))) if lifted.size else 0.0
+    if peak <= ceiling:
+        return lifted
+    dry64 = np.asarray(dry, dtype=np.float64)
+    if float(np.max(np.abs(dry64))) >= ceiling:
+        return dry64
+    added = lifted - dry64
+    best = dry64
+    lo, hi = 0.0, 1.0
+    for _ in range(16):
+        mid = (lo + hi) * 0.5
+        mix = dry64 + added * mid
+        if float(np.max(np.abs(mix))) <= ceiling:
+            best = mix
+            lo = mid
+        else:
+            hi = mid
+    return best
+
+
+def apply_dialogue_lift(
+    audio: np.ndarray,
+    sr: int,
+    lift_db: float,
+    voicing: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Restore presence on voiced frames and on consonants beside a vowel.
+
+    ``lift_db`` is the cap for the 1.8–4 kHz band. Zero or less returns
+    ``audio`` unchanged, which is how Manual and the 1.2.1 scenes stay
+    bit-identical. ``voicing`` is the debounced periodicity and f0 already
+    measured for this chunk. The f0 is accepted so the call matches the
+    gate, and it is not used: a consonant has no harmonic to protect.
+    """
+    if lift_db <= 0.0 or audio.shape[-1] < DIALOGUE_FRAME * 4:
+        return audio
+    if sr != MODEL_SR or audio.ndim != 2:
+        raise ValueError(
+            f"Dialogue lift expected {MODEL_SR} Hz audio shaped (channels, frames)."
+        )
+    if not np.isfinite(audio).all():
+        raise ValueError("Dialogue lift was given invalid samples.")
+
+    mono = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    _freqs, _times, spectrum = stft(
+        mono, fs=sr, window="hann", nperseg=DIALOGUE_FRAME,
+        noverlap=DIALOGUE_FRAME - DIALOGUE_HOP, boundary=None, padded=False,
+    )
+    magnitude = np.abs(spectrum)
+    n_bins, n_times = magnitude.shape
+    if n_times == 0:
+        return audio
+    body = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_BODY)
+    presence = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_PRESENCE)
+    air = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_AIR)
+    speech = slice(presence.start, air.stop)
+
+    body_power = np.mean(magnitude[body] ** 2, axis=0)
+    presence_power = np.mean(magnitude[presence] ** 2, axis=0)
+    # dBFS of the samples in each frame. Mean STFT-bin power makes a
+    # high-band consonant look like silence, because most bins are empty.
+    squared = mono * mono
+    cumulative = np.empty(squared.size + 1, dtype=np.float64)
+    cumulative[0] = 0.0
+    np.cumsum(squared, out=cumulative[1:])
+    starts = np.arange(n_times, dtype=np.int64) * DIALOGUE_HOP
+    stops = np.minimum(starts + DIALOGUE_FRAME, mono.size)
+    frame_ms = (cumulative[stops] - cumulative[starts]) / DIALOGUE_FRAME
+
+    if voicing is None:
+        periodicity, _f0 = estimate_voicing(mono, sr)
+        periodicity = _debounce_voicing(periodicity)
+    else:
+        periodicity = voicing[0]
+    if periodicity.size:
+        source = np.arange(periodicity.size) * VOICE_HOP + VOICE_FRAME / 2
+        target = np.arange(n_times) * DIALOGUE_HOP + DIALOGUE_FRAME / 2
+        period = np.interp(target, source, periodicity, left=0.0, right=0.0)
+    else:
+        period = np.zeros(n_times, dtype=np.float64)
+    voiced = period >= VOICING_MIN
+
+    level = np.sqrt(np.maximum(presence_power, 0.0))
+    smoothed = uniform_filter1d(level, size=3, mode="nearest")
+    window = max(3, int(round(GATE_TRACK_S * sr / DIALOGUE_HOP)))
+    window = min(window, max(1, smoothed.size))
+    floor = np.maximum(minimum_filter1d(smoothed, size=window, mode="nearest"), 0.0)
+    floor *= DIALOGUE_FLOOR_BIAS
+
+    band = np.maximum(magnitude[speech], 1e-12)
+    flatness = np.exp(np.mean(np.log(band), axis=0)) / np.maximum(np.mean(band, axis=0), 1e-12)
+    reach = max(1, int(round(DIALOGUE_VOICE_REACH_S * sr / DIALOGUE_HOP)))
+    near_voice = maximum_filter1d(
+        voiced.astype(np.float64), size=2 * reach + 1, mode="nearest") > 0.5
+    with np.errstate(divide="ignore"):
+        frame_db = 10.0 * np.log10(np.maximum(frame_ms, 1e-12))
+        margin = 10.0 ** (DIALOGUE_CONSONANT_MARGIN_DB / 20.0)
+    audible = frame_db >= DIALOGUE_SILENCE_DBFS
+    consonant = (
+        ~voiced
+        & near_voice
+        & (flatness >= DIALOGUE_FLATNESS_MIN)
+        & (level >= floor * margin)
+        & audible
+    )
+    active = (voiced & audible) | consonant
+
+    presence_db = 10.0 * np.log10(np.maximum(presence_power, 1e-12))
+    body_db = 10.0 * np.log10(np.maximum(body_power, 1e-12))
+    body_usable = body_power > np.maximum(presence_power, 1e-12) * 10.0 ** (-30.0 / 10.0)
+    deficit = np.clip(DIALOGUE_TARGET_TILT_DB - (presence_db - body_db), 0.0, lift_db)
+    deficit = np.where(body_usable, deficit, lift_db)
+    deficit = np.where(active, deficit, 0.0)
+
+    gain = np.ones((n_bins, n_times), dtype=np.float64)
+    gain[presence] = 10.0 ** (deficit / 20.0)
+    gain[air] = 10.0 ** (DIALOGUE_AIR_SHARE * deficit / 20.0)
+    _cosine_fade(gain, presence, DIALOGUE_EDGE_BINS)
+    _cosine_fade(gain, air, DIALOGUE_EDGE_BINS)
+    gain = uniform_filter1d(gain, size=5, axis=1, mode="nearest")
+    # uniform_filter1d's running sum can undershoot a non-negative input.
+    gain = np.clip(gain, 1.0, 10.0 ** (lift_db / 20.0))
+    near_unity = np.abs(gain - 1.0) < (10.0 ** (0.05 / 20.0) - 1.0)
+    gain = np.where(near_unity, 1.0, gain)
+    if np.all(gain == 1.0):
+        return audio
+
+    lifted = _apply_spectral_gain(audio, sr, gain - 1.0, DIALOGUE_FRAME, DIALOGUE_HOP)
+    lifted = _limit_lift(audio, lifted)
+    if not np.isfinite(lifted).all():
+        raise ValueError("Dialogue lift produced invalid samples.")
+    return np.ascontiguousarray(lifted, dtype=np.float32)
+
+
 def apply_scene(
     audio: np.ndarray, sr: int, preset: ScenePreset, state: ConditionerState | None = None
 ) -> np.ndarray:
@@ -1350,6 +1570,7 @@ def _preset(**overrides) -> ScenePreset:
         gate_db=0.0,
         gate_lo_hz=None,
         gate_hi_hz=None,
+        lift_db=0.0,
     )
     base.update(overrides)
     return ScenePreset(**base)
@@ -1429,6 +1650,32 @@ STREET = _preset(
     gate_lo_hz=1500.0,
     gate_hi_hz=6000.0,
 )
+CONVERSATION = _preset(
+    key="conversation",
+    label="Conversation (1–5 m)",
+    summary=(
+        "For talk a few metres away. Leaves the street down, and lifts "
+        "the consonants the other scenes hold back."
+    ),
+    atten_db=18,
+    post_filter=False,
+    post_filter_beta=0.02,
+    infrasonic_hz=30.0,
+    gust_split_hz=110.0,
+    gust_max_db=4.0,
+    gust_margin_db=8.0,
+    gust_voiced_cap_db=1.5,
+    gust_attack_s=0.035,
+    gust_release_s=0.50,
+    notch_lo_hz=80.0,
+    notch_hi_hz=200.0,
+    notch_max_db=8.0,
+    notch_max_count=2,
+    gate_db=6.0,
+    gate_lo_hz=2200.0,
+    gate_hi_hz=7000.0,
+    lift_db=LIFT_CLEAR_DB,
+)
 PODCAST = _preset(
     key="podcast",
     label="Subtle Podcast Clean",
@@ -1450,9 +1697,9 @@ MANUAL = _preset(
 )
 
 SCENES: dict[str, ScenePreset] = {
-    preset.key: preset for preset in (MANUAL, WIND, TRAFFIC, STREET, PODCAST)
+    preset.key: preset for preset in (MANUAL, WIND, TRAFFIC, STREET, CONVERSATION, PODCAST)
 }
-SCENE_ORDER = ("manual", "wind", "traffic", "street", "podcast")
+SCENE_ORDER = ("manual", "wind", "traffic", "street", "conversation", "podcast")
 SCENE_BY_LABEL = {preset.label: preset for preset in SCENES.values()}
 
 
@@ -1589,15 +1836,18 @@ def load_model():
 
 def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
             scene: ScenePreset | None = None,
+            lift_db: float = 0.0,
             progress=None, cancel: threading.Event | None = None,
             stats: dict | None = None) -> np.ndarray:
     """Run DeepFilterNet over 48 kHz audio (channels, frames) in overlapping chunks.
 
     A named scene conditions each extended chunk before the network sees it.
     Manual passes the audio through unchanged, so today's slider and rumble
-    settings keep today's results. The torch tensor is one chunk, not the file.
-    ``stats``, if given, gains "clicks" and "pops": the transients repaired,
-    each counted once, in the chunk whose output keeps it.
+    settings keep today's results. ``lift_db`` above zero restores consonant
+    presence after the network; zero leaves the chunk untouched by that stage.
+    The torch tensor is one chunk, not the file. ``stats``, if given, gains
+    "clicks" and "pops": the transients repaired, each counted once, in the
+    chunk whose output keeps it.
     """
     import torch
     from df.enhance import enhance
@@ -1642,21 +1892,27 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
             enhanced = enhance(
                 model, df_state, torch.from_numpy(segment), atten_lim_db=atten_lim_db)
         piece = np.ascontiguousarray(enhanced.detach().cpu().numpy(), dtype=np.float32)
-        if active and (scene.uses_floor or scene.uses_gate):
+        wants_lift = lift_db > 0.0
+        if (active and (scene.uses_floor or scene.uses_gate)) or wants_lift:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
-            # Voicing of the network's output, measured once for both stages.
+            # Voicing of the network's output, measured once for every stage.
             mid = np.ascontiguousarray(piece.mean(axis=0), dtype=np.float64)
             periodicity, f0 = estimate_voicing(mid, sr)
             voicing = (_debounce_voicing(periodicity), f0)
-            if scene.uses_floor:
+            if active and scene.uses_floor:
                 piece = np.ascontiguousarray(
                     soften_musical_noise(piece, sr, scene, voicing), dtype=np.float32)
-            if scene.uses_gate:
+            if active and scene.uses_gate:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled()
                 piece = np.ascontiguousarray(
                     apply_noise_floor_gate(piece, sr, scene, voicing), dtype=np.float32)
+            if wants_lift:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                piece = np.ascontiguousarray(
+                    apply_dialogue_lift(piece, sr, lift_db, voicing), dtype=np.float32)
         expected = tail - pre_start
         if piece.shape[-1] < expected:
             piece = np.pad(piece, ((0, 0), (0, expected - piece.shape[-1])))
@@ -1753,6 +2009,159 @@ def friendly_error(stage: str, exc: Exception) -> str:
         return (f"The DeepFilterNet model didn't load ({exc}). The first run needs an "
                 "internet connection to download it.")
     return f"{type(exc).__name__}: {exc}"
+
+
+@dataclass(frozen=True)
+class CaptionCue:
+    """One subtitle, in seconds on the same clock as the 48 kHz buffer."""
+
+    start_s: float
+    end_s: float
+    text: str
+
+
+def caption_model_dir(output_dir: Path | None) -> Path:
+    """Folder for the subtitle weights. Prefer D:, away from the tight system drive."""
+    candidates = [Path(r"D:\Audio\Models")]
+    if output_dir:
+        candidates.append(Path(output_dir) / "models")
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        return candidate
+    raise OSError(
+        "Couldn't create a folder for the subtitle model "
+        "(tried D:\\Audio\\Models and the output folder)."
+    )
+
+
+def _greedy_words(
+    emissions: np.ndarray, labels: tuple[str, ...], offset_s: float
+) -> list[CaptionCue]:
+    """Greedy CTC decode to lowercase words with start and end times.
+
+    ``emissions`` is (time, classes) for one 16 kHz chunk. Repeated tokens
+    collapse. The blank is labels[0]. ``|`` breaks words.
+    """
+    if emissions.ndim != 2 or emissions.shape[1] != len(labels):
+        raise ValueError(
+            f"Expected emissions (time, {len(labels)}), got {tuple(emissions.shape)}."
+        )
+    try:
+        boundary = labels.index("|")
+    except ValueError as exc:
+        raise ValueError("The recogniser labels have no word boundary '|'.") from exc
+    blank = 0
+    chosen = np.argmax(emissions, axis=1)
+    words: list[CaptionCue] = []
+    chars: list[str] = []
+    start: int | None = None
+    previous = blank
+
+    def close(end_frame: int) -> None:
+        nonlocal start
+        if chars and start is not None:
+            words.append(CaptionCue(
+                offset_s + start * CTC_STRIDE / ASR_SR,
+                offset_s + end_frame * CTC_STRIDE / ASR_SR,
+                "".join(chars).lower(),
+            ))
+        chars.clear()
+        start = None
+
+    for frame, token in enumerate(chosen.tolist()):
+        if token == previous:
+            continue
+        previous = token
+        if token == blank:
+            continue
+        if token == boundary:
+            close(frame)
+            continue
+        if start is None:
+            start = frame
+        letter = labels[token]
+        if letter:
+            chars.append(letter)
+    close(int(chosen.shape[0]))
+    return words
+
+
+def pack_cues(words: list[CaptionCue]) -> list[CaptionCue]:
+    """Group words into readable cues. A gap, 42 characters or 6 s starts a new one."""
+    cues: list[CaptionCue] = []
+    bucket: list[CaptionCue] = []
+
+    def flush() -> None:
+        if not bucket:
+            return
+        text = " ".join(word.text for word in bucket)
+        start_s = bucket[0].start_s
+        end_s = min(max(bucket[-1].end_s + CUE_TAIL_S, start_s + CUE_MIN_S), start_s + CUE_MAX_S)
+        cues.append(CaptionCue(start_s, end_s, text))
+        bucket.clear()
+
+    for word in words:
+        if not word.text:
+            continue
+        gap = bool(bucket) and (word.start_s - bucket[-1].end_s) > CUE_GAP_S
+        too_long = bool(bucket) and (word.end_s - bucket[0].start_s) > CUE_MAX_S
+        width = len(" ".join(item.text for item in bucket))
+        too_wide = bool(bucket) and (width + 1 + len(word.text)) > CUE_MAX_CHARS
+        if gap or too_long or too_wide:
+            flush()
+        bucket.append(word)
+    flush()
+    fitted: list[CaptionCue] = []
+    for index, cue in enumerate(cues):
+        end_s = cue.end_s
+        if index + 1 < len(cues):
+            end_s = min(end_s, cues[index + 1].start_s)
+        if end_s > cue.start_s:
+            fitted.append(CaptionCue(cue.start_s, end_s, cue.text))
+    return fitted
+
+
+def _srt_time(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0.0:
+        seconds = 0.0
+    whole = int(seconds)
+    millis = int(round((seconds - whole) * 1000.0))
+    if millis == 1000:
+        whole += 1
+        millis = 0
+    hours, rem = divmod(whole, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _replace_text(path: Path, text: str) -> None:
+    partial = path.with_suffix(path.suffix + ".partial")
+    try:
+        partial.write_text(text, encoding="utf-8")
+        os.replace(partial, path)
+    except OSError:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def write_transcript(path: Path, cues: list[CaptionCue]) -> Path:
+    """Write a .srt beside ``path`` and a .txt of the same words. Returns the .srt path."""
+    srt_path = path.with_suffix(".srt")
+    txt_path = path.with_suffix(".txt")
+    blocks = [
+        f"{index}\n{_srt_time(cue.start_s)} --> {_srt_time(cue.end_s)}\n{cue.text}\n"
+        for index, cue in enumerate(cues, start=1)
+    ]
+    _replace_text(srt_path, "\n".join(blocks) + ("\n" if blocks else ""))
+    paragraph = " ".join(cue.text for cue in cues).strip()
+    _replace_text(txt_path, (paragraph + "\n") if paragraph else "")
+    return srt_path
 
 
 # --------------------------------------------------------------------------- #
@@ -1973,8 +2382,8 @@ class AudioDeNoiserApp(ctk.CTk):
     def __init__(self, initial_file: str | None = None) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("860x820")
-        self.minsize(760, 804)  # any shorter and the log box loses its last line
+        self.geometry("860x978")
+        self.minsize(760, 954)  # measured: any shorter and the log box loses its last line
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
@@ -1997,9 +2406,14 @@ class AudioDeNoiserApp(ctk.CTk):
         self.original_lufs = float("-inf")
         self.denoised_lufs = float("-inf")
         self.denoised_peak = 0.0
-        self.busy: str | None = None  # None, "load" or "denoise"
+        self.busy: str | None = None  # None, "load", "denoise" or "captions"
         self._last_time_text = ""
         self._pending_file = initial_file
+        self._cues: list[CaptionCue] = []
+        self._cue_text = ""
+        self._caption_warned = False
+        self._caption_model = None
+        self._caption_labels: tuple[str, ...] | None = None
 
         self._build_ui()
         self._bind_keys()
@@ -2062,9 +2476,21 @@ class AudioDeNoiserApp(ctk.CTk):
         self.waveform = WaveformView(wave_frame, on_seek=self._seek)
         self.waveform.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
+        # Subtitles --------------------------------------------------------
+        sub_bar = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=10, height=48)
+        sub_bar.grid(row=3, column=0, sticky="ew", pady=(0, 8), **pad)
+        sub_bar.grid_propagate(False)
+        sub_bar.grid_columnconfigure(0, weight=1)
+        self.subtitle_label = ctk.CTkLabel(
+            sub_bar, text="", anchor="w", justify="left", font=self._font(15),
+            text_color=C_AMBER, wraplength=620)
+        self.subtitle_label.grid(row=0, column=0, sticky="ew", padx=(14, 8), pady=6)
+        self.save_text_btn = self._secondary_button(sub_bar, "Save text", self.save_transcript, 100)
+        self.save_text_btn.grid(row=0, column=1, padx=(0, 12), pady=6)
+
         # Transport --------------------------------------------------------
         transport = ctk.CTkFrame(self, fg_color="transparent")
-        transport.grid(row=3, column=0, sticky="ew", pady=(0, 10), **pad)
+        transport.grid(row=4, column=0, sticky="ew", pady=(0, 10), **pad)
         transport.grid_columnconfigure(5, weight=1)
         self.play_btn = self._secondary_button(transport, "Play", self.toggle_play, 90)
         self.play_btn.grid(row=0, column=0, padx=(0, 6))
@@ -2089,7 +2515,7 @@ class AudioDeNoiserApp(ctk.CTk):
 
         # Settings ---------------------------------------------------------
         panel = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=10)
-        panel.grid(row=4, column=0, sticky="ew", pady=(0, 10), **pad)
+        panel.grid(row=5, column=0, sticky="ew", pady=(0, 10), **pad)
         panel.grid_columnconfigure(1, weight=1)
         label_opts = {"font": self._font(13), "text_color": C_TEXT, "anchor": "w"}
         hint_opts = {"font": self._font(12), "text_color": C_MUTED, "anchor": "w"}
@@ -2100,7 +2526,7 @@ class AudioDeNoiserApp(ctk.CTk):
             row=0, column=0, sticky="w", **row_pad)
         self.scene_menu = ctk.CTkOptionMenu(
             panel, values=[SCENES[key].label for key in SCENE_ORDER],
-            variable=self.scene_var, width=220, command=self._on_scene_change,
+            variable=self.scene_var, width=240, command=self._on_scene_change,
             fg_color=C_LINE, button_color=C_LINE, button_hover_color=C_LINE_HOVER,
             text_color=C_TEXT, font=self._font(13))
         self.scene_menu.grid(row=0, column=1, columnspan=2, sticky="w",
@@ -2109,7 +2535,18 @@ class AudioDeNoiserApp(ctk.CTk):
             panel, text=SCENES[self._applied_scene].summary, wraplength=640, **hint_opts)
         self.scene_hint.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14))
 
-        ctk.CTkLabel(panel, text="Noise reduction", **label_opts).grid(row=2, column=0, sticky="w", **row_pad)
+        ctk.CTkLabel(panel, text="Dialogue", **label_opts).grid(
+            row=2, column=0, sticky="w", **row_pad)
+        self.lift_var = ctk.StringVar(value=self._saved_lift_label())
+        self.lift_menu = ctk.CTkOptionMenu(
+            panel, values=list(LIFT_CHOICES), variable=self.lift_var, width=120,
+            command=self._on_lift_change, fg_color=C_LINE, button_color=C_LINE,
+            button_hover_color=C_LINE_HOVER, text_color=C_TEXT, font=self._font(13))
+        self.lift_menu.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ctk.CTkLabel(panel, text="Lifts consonants a few metres away. Off keeps today's sound.",
+                     **hint_opts).grid(row=2, column=2, sticky="w", padx=(0, 14), pady=(8, 0))
+
+        ctk.CTkLabel(panel, text="Noise reduction", **label_opts).grid(row=3, column=0, sticky="w", **row_pad)
         self.atten_index = int(self.settings.get("atten_index", len(ATTEN_STEPS) - 1))
         self.atten_index = max(0, min(len(ATTEN_STEPS) - 1, self.atten_index))
         self.atten_slider = ctk.CTkSlider(panel, from_=0, to=len(ATTEN_STEPS) - 1,
@@ -2117,18 +2554,18 @@ class AudioDeNoiserApp(ctk.CTk):
                                           command=self._on_atten_change, progress_color=C_AMBER,
                                           button_color=C_AMBER, button_hover_color=C_AMBER_HOVER)
         self.atten_slider.set(self.atten_index)
-        self.atten_slider.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
+        self.atten_slider.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
         self.atten_value = ctk.CTkLabel(panel, text="", width=90, **label_opts)
-        self.atten_value.grid(row=2, column=2, sticky="w", padx=(0, 14), pady=(8, 0))
+        self.atten_value.grid(row=3, column=2, sticky="w", padx=(0, 14), pady=(8, 0))
         ctk.CTkLabel(panel, text="Lower limits leave a little background in and sound more natural",
-                     **hint_opts).grid(row=3, column=1, columnspan=2, sticky="w")
+                     **hint_opts).grid(row=4, column=1, columnspan=2, sticky="w")
 
-        ctk.CTkLabel(panel, text="Rumble filter", **label_opts).grid(row=4, column=0, sticky="w", **row_pad)
+        ctk.CTkLabel(panel, text="Rumble filter", **label_opts).grid(row=5, column=0, sticky="w", **row_pad)
         self.highpass_var = ctk.StringVar(value=self.settings.get("highpass", "80 Hz"))
         if self.highpass_var.get() not in HIGHPASS_CHOICES:
             self.highpass_var.set("80 Hz")
         hp_row = ctk.CTkFrame(panel, fg_color="transparent")
-        hp_row.grid(row=4, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        hp_row.grid(row=5, column=1, columnspan=2, sticky="w", pady=(8, 0))
         self.highpass_menu = ctk.CTkOptionMenu(hp_row, values=list(HIGHPASS_CHOICES),
                                                variable=self.highpass_var, width=110,
                                                command=lambda _v: self._save_settings(),
@@ -2140,7 +2577,7 @@ class AudioDeNoiserApp(ctk.CTk):
                      **hint_opts).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         switches = ctk.CTkFrame(panel, fg_color="transparent")
-        switches.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 0))
+        switches.grid(row=6, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 0))
         self.postfilter_var = ctk.BooleanVar(value=bool(self.settings.get("post_filter", False)))
         self.postfilter_switch = ctk.CTkSwitch(switches, text="Post-filter for very noisy passages",
                                                variable=self.postfilter_var, font=self._font(13),
@@ -2154,9 +2591,15 @@ class AudioDeNoiserApp(ctk.CTk):
                                               text_color=C_TEXT, progress_color=C_AMBER,
                                               command=self._save_settings)
         self.normalise_switch.grid(row=0, column=1, sticky="w")
+        self.subtitles_var = ctk.BooleanVar(value=bool(self.settings.get("subtitles", False)))
+        self.subtitles_switch = ctk.CTkSwitch(
+            switches, text="Subtitles while playing", variable=self.subtitles_var,
+            font=self._font(13), text_color=C_TEXT, progress_color=C_AMBER,
+            command=self._save_settings)
+        self.subtitles_switch.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         out_row = ctk.CTkFrame(panel, fg_color="transparent")
-        out_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=14, pady=(10, 12))
+        out_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=14, pady=(10, 12))
         out_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(out_row, text="Save to", **label_opts).grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.out_label = ctk.CTkLabel(out_row, text="", **hint_opts)
@@ -2168,7 +2611,7 @@ class AudioDeNoiserApp(ctk.CTk):
 
         # Action row -------------------------------------------------------
         action = ctk.CTkFrame(self, fg_color="transparent")
-        action.grid(row=5, column=0, sticky="ew", pady=(0, 8), **pad)
+        action.grid(row=6, column=0, sticky="ew", pady=(0, 8), **pad)
         action.grid_columnconfigure(0, weight=1)
         self.denoise_btn = ctk.CTkButton(action, text="Denoise", command=self.start_denoise,
                                          height=44, font=self._font(16, "bold"),
@@ -2194,7 +2637,7 @@ class AudioDeNoiserApp(ctk.CTk):
         # Log --------------------------------------------------------------
         self.log_box = ctk.CTkTextbox(self, height=92, fg_color=C_PANEL, text_color=C_TEXT,
                                       font=self._font(12), corner_radius=10, wrap="word")
-        self.log_box.grid(row=6, column=0, sticky="ew", pady=(0, 16), **pad)
+        self.log_box.grid(row=7, column=0, sticky="ew", pady=(0, 16), **pad)
         self.log_box.configure(state="disabled")
 
         self._on_atten_change(self.atten_index)
@@ -2244,6 +2687,7 @@ class AudioDeNoiserApp(ctk.CTk):
         # the save must already know the scene is active or it will overwrite the
         # Manual snapshot with the preset values.
         self._applied_scene = preset.key
+        self.lift_var.set(lift_label(preset.lift_db))
         if preset.active:
             if preset.atten_db in ATTEN_STEPS:
                 self.atten_index = ATTEN_STEPS.index(preset.atten_db)
@@ -2267,6 +2711,10 @@ class AudioDeNoiserApp(ctk.CTk):
             "loudness_match": bool(self.loudness_var.get()),
             "scene": scene_key,
         }
+        if hasattr(self, "lift_var"):
+            data["dialogue_lift"] = self.lift_var.get().lower()
+        if hasattr(self, "subtitles_var"):
+            data["subtitles"] = bool(self.subtitles_var.get())
         if not SCENES[scene_key].active:
             data["manual_highpass"] = self.highpass_var.get()
             data["manual_atten_index"] = self.atten_index
@@ -2329,15 +2777,17 @@ class AudioDeNoiserApp(ctk.CTk):
         on = lambda flag: "normal" if flag else "disabled"
         self.open_btn.configure(state=on(idle))
         self.denoise_btn.configure(state=on(idle and has_file and self.model is not None))
-        cancellable = self.busy == "denoise"
+        cancellable = self.busy in ("denoise", "captions")
         self.cancel_btn.configure(state=on(cancellable),
                                   fg_color=C_DANGER if cancellable else C_LINE)
         scene_active = SCENES.get(self._applied_scene, MANUAL).active
         self.scene_menu.configure(state=on(idle))
+        self.lift_menu.configure(state=on(idle))
         self.highpass_menu.configure(state=on(idle and not scene_active))
         for widget in (self.atten_slider, self.postfilter_switch,
-                       self.normalise_switch, self.change_btn):
+                       self.normalise_switch, self.subtitles_switch, self.change_btn):
             widget.configure(state=on(idle))
+        self.save_text_btn.configure(state=on(bool(self._cues) and bool(self.output_path)))
         can_play = has_file and sd is not None
         self.play_btn.configure(state=on(can_play))
         self.stop_btn.configure(state=on(can_play))
@@ -2365,6 +2815,37 @@ class AudioDeNoiserApp(ctk.CTk):
                 self.time_label.configure(text=text)
                 self._last_time_text = text
             self.waveform.set_playhead(pos / n)
+            self._show_subtitle(pos / MODEL_SR)
+
+    def _saved_lift_label(self) -> str:
+        """Dialogue menu value: the saved choice, or the scene's own default."""
+        fallback = lift_label(SCENES.get(self._applied_scene, MANUAL).lift_db)
+        saved = str(self.settings.get("dialogue_lift", "")).lower()
+        return {"off": "Off", "gentle": "Gentle", "clear": "Clear"}.get(saved, fallback)
+
+    def _on_lift_change(self, _value: str) -> None:
+        self._save_settings()
+
+    def _show_subtitle(self, seconds: float) -> None:
+        text = ""
+        for cue in self._cues:
+            if cue.start_s <= seconds < cue.end_s:
+                text = cue.text
+                break
+        if text == self._cue_text:
+            return
+        self._cue_text = text
+        self.subtitle_label.configure(text=text)
+
+    def save_transcript(self) -> None:
+        if not self._cues or not self.output_path:
+            return
+        try:
+            srt_path = write_transcript(Path(self.output_path), self._cues)
+        except OSError as exc:
+            self.log(f"Couldn't save the transcript: {exc}")
+            return
+        self.log(f"Saved {srt_path} and {srt_path.with_suffix('.txt')}.")
 
     # ------------------------------------------------------------ actions --
     def open_file(self, path: str | None = None) -> None:
@@ -2401,6 +2882,8 @@ class AudioDeNoiserApp(ctk.CTk):
             "normalise": bool(self.normalise_var.get()),
             "scene": self._applied_scene,
             "subtype": self.source_subtype or "PCM_24",
+            "lift_db": LIFT_CHOICES.get(self.lift_var.get(), 0.0),
+            "subtitles": bool(self.subtitles_var.get()),
         }
         self.cancel_event.clear()
         self.progress.set(0)
@@ -2408,10 +2891,13 @@ class AudioDeNoiserApp(ctk.CTk):
         self._run_job("denoise", self._job_denoise, self.audio48, self.model, self.df_state, opts)
 
     def cancel_denoise(self) -> None:
-        if self.busy == "denoise":
+        if self.busy in ("denoise", "captions"):
             self.cancel_event.set()
             self.cancel_btn.configure(state="disabled", fg_color=C_LINE)
-            self.log("Cancelling after the current chunk…")
+            if self.busy == "captions":
+                self.log("Cancelling subtitles after the current block…")
+            else:
+                self.log("Cancelling after the current chunk…")
 
     def toggle_play(self) -> None:
         if self.audio48 is None or sd is None:
@@ -2508,6 +2994,7 @@ class AudioDeNoiserApp(ctk.CTk):
         den48 = None
         elapsed = 0.0
         stats: dict[str, int] = {}
+        lift_db = float(opts.get("lift_db", 0.0) or 0.0)
         try:
             model.post_filter = opts["post_filter"]
             if preset.active and previous_beta is not None:
@@ -2519,10 +3006,15 @@ class AudioDeNoiserApp(ctk.CTk):
                 detail += f", rumble filter {opts['highpass']} Hz"
             if opts["post_filter"]:
                 detail += ", post-filter on"
+            if lift_db >= LIFT_CLEAR_DB:
+                detail += ", dialogue clear"
+            elif lift_db > 0.0:
+                detail += ", dialogue gentle"
             put(("log", detail))
             started = time.perf_counter()
             den48 = denoise(
                 model, df_state, work, limit, scene=preset if preset.active else None,
+                lift_db=lift_db,
                 progress=lambda fraction: put(("progress", fraction)),
                 cancel=self.cancel_event, stats=stats)
             elapsed = time.perf_counter() - started
@@ -2563,7 +3055,66 @@ class AudioDeNoiserApp(ctk.CTk):
                               "env": waveform_envelope(den48), "elapsed": elapsed,
                               "gain_db": gain_db, "clipped": clipped,
                               "lufs": lufs, "peak": peak, "subtype": subtype,
-                              "guard": preset.transient_guard, "stats": stats}))
+                              "guard": preset.transient_guard, "stats": stats,
+                              "subtitles": bool(opts.get("subtitles", False))}))
+
+    def _job_captions(self, den48: np.ndarray, wav_path: str) -> None:
+        """Recognise the denoised audio in 20 s blocks. The wav is already saved."""
+        import torch
+        from torchaudio.pipelines import WAV2VEC2_ASR_BASE_960H
+
+        put = self.events.put
+        if den48 is None or den48.size == 0 or den48.shape[-1] < MODEL_SR // 4:
+            put(("captions_done", {"cues": [], "wav_path": wav_path}))
+            return
+        try:
+            if self._caption_model is None or self._caption_labels is None:
+                model_dir = caption_model_dir(self.output_dir)
+                torch.hub.set_dir(str(model_dir))
+                put(("log", f"Loading the subtitle model. The first run downloads it to {model_dir}."))
+                bundle = WAV2VEC2_ASR_BASE_960H
+                model = bundle.get_model()
+                model.eval()
+                self._caption_model = model
+                self._caption_labels = tuple(bundle.get_labels())
+            model = self._caption_model
+            labels = self._caption_labels
+        except Exception as exc:
+            put(("captions_failed", str(exc)))
+            return
+
+        mono = den48.mean(axis=0) if den48.shape[0] > 1 else den48[0]
+        mono = np.ascontiguousarray(mono, dtype=np.float32)
+        audio16 = resample(mono[None, :], MODEL_SR, ASR_SR)[0]
+        chunk = int(ASR_CHUNK_S * ASR_SR)
+        overlap = int(ASR_OVERLAP_S * ASR_SR)
+        step = max(1, chunk - overlap)
+        words: list[CaptionCue] = []
+        covered = 0.0
+        pos = 0
+        total = max(1, int(audio16.shape[0]))
+        while pos < audio16.shape[0]:
+            if self.cancel_event.is_set():
+                put(("captions_cancelled", pack_cues(words)))
+                return
+            piece = np.ascontiguousarray(audio16[pos:pos + chunk], dtype=np.float32)
+            if piece.shape[0] < CTC_STRIDE * 2:
+                break
+            offset_s = pos / ASR_SR
+            is_last = pos + chunk >= audio16.shape[0]
+            limit = math.inf if is_last else (pos + step) / ASR_SR
+            try:
+                with torch.inference_mode():
+                    emissions, _length = model(torch.from_numpy(piece).unsqueeze(0))
+                fresh = _greedy_words(emissions[0].detach().cpu().numpy(), labels, offset_s)
+            except Exception as exc:
+                put(("captions_failed", str(exc)))
+                return
+            words.extend(word for word in fresh if covered <= word.start_s < limit)
+            covered = limit
+            pos += step
+            put(("captions_progress", (min(pos, total) / total, pack_cues(words))))
+        put(("captions_done", {"cues": pack_cues(words), "wav_path": wav_path}))
 
     # ------------------------------------------------------- event pump --
     def _poll(self) -> None:
@@ -2604,6 +3155,9 @@ class AudioDeNoiserApp(ctk.CTk):
         self.player.load_original(self.audio48)
         self.waveform.set_data(self.orig_env, None)
         self.waveform.set_playhead(0.0)
+        self._cues = []
+        self._cue_text = ""
+        self.subtitle_label.configure(text="")
         channels = {1: "mono", 2: "stereo"}.get(info["channels"], f"{info['channels']} channels")
         details = f"{info['sr'] / 1000:g} kHz {channels}"
         if self.source_subtype is not None:
@@ -2652,7 +3206,12 @@ class AudioDeNoiserApp(ctk.CTk):
         self.log(f"Saved {self.output_path} ({DEPTH_LABELS[info['subtype']]} WAV).")
         self._apply_playback_gains(announce=True)
         self.log("Press B to hear the denoised version, A for the original.")
-        self._refresh_controls()
+        self._cues = []
+        self._show_subtitle(0.0)
+        if info.get("subtitles"):
+            self._run_job("captions", self._job_captions, info["den48"], info["path"])
+        else:
+            self._refresh_controls()
 
     def _on_cancelled(self, _payload) -> None:
         self.busy = None
@@ -2670,6 +3229,53 @@ class AudioDeNoiserApp(ctk.CTk):
             self.progress.set(0)
             self.progress_label.configure(text="")
         self.log(f"Error: {message}")
+        self._refresh_controls()
+
+    def _on_captions_progress(self, payload) -> None:
+        fraction, cues = payload
+        self._cues = cues
+        self.progress.set(fraction)
+        self.progress_label.configure(text=f"{int(fraction * 100)}%")
+        if self.player.length:
+            self._show_subtitle(self.player.position / MODEL_SR)
+        self._refresh_controls()
+
+    def _on_captions_done(self, info: dict) -> None:
+        self.busy = None
+        self._cues = info.get("cues") or []
+        self.progress.set(1.0 if self._cues else 0.0)
+        self.progress_label.configure(text="100%" if self._cues else "")
+        count = len(self._cues)
+        if count == 0:
+            self.log("No speech recognised for subtitles.")
+        else:
+            noun = "line" if count == 1 else "lines"
+            self.log(f"Subtitles ready: {count} {noun}.")
+            if not self._caption_warned:
+                self.log("Transcript is a best effort from a read-speech model. "
+                         "Names and street noise will be misspelt.")
+                self._caption_warned = True
+        if self.player.length:
+            self._show_subtitle(self.player.position / MODEL_SR)
+        self._refresh_controls()
+
+    def _on_captions_cancelled(self, cues) -> None:
+        self.busy = None
+        self._cues = cues or []
+        self.progress.set(0)
+        self.progress_label.configure(text="")
+        if self._cues:
+            self.log("Subtitles stopped. The denoised file is already saved, "
+                     "and Save text will write what was recognised so far.")
+        else:
+            self.log("Subtitles stopped. The denoised file is already saved.")
+        self._refresh_controls()
+
+    def _on_captions_failed(self, message: str) -> None:
+        self.busy = None
+        self.progress.set(0)
+        self.progress_label.configure(text="")
+        self.log(f"Subtitles skipped: {message}")
         self._refresh_controls()
 
 

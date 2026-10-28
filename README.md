@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.2-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.3.0-F2A93B)
 
 </div>
 
@@ -25,7 +25,9 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 
 | Feature | Detail |
 | --- | --- |
-| Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
+| Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
+| Dialogue lift | Off, Gentle or Clear. Raises consonants a few metres away after the model. Off, the default everywhere except Conversation, leaves the audio untouched |
+| Subtitles | Optional. After the file is saved, words from the denoised audio follow the playhead, and Save text writes an SRT and a plain transcript beside the WAV |
 | Transient guard | Heavy Wind and Highway repair isolated clicks, ticks and knocks (autoregressive interpolation) and low pops in pauses before the model, which otherwise passes them. Consonant bursts are left alone |
 | Floor gate | Heavy Wind, Highway and Pedestrian Street lower the steady wash the model leaves under its blend limit, by up to 10, 12 or 8 dB, with voiced harmonics protected |
 | Wind and traffic rumble attenuation | On Manual, an optional Butterworth high-pass at 60, 80, 100 or 120 Hz. A named scene replaces that switch with its own low-end stage |
@@ -40,7 +42,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 
 1. Decode WAV, MP3, FLAC or OGG with `soundfile` and resample to 48 kHz.
 2. **Manual** is the 1.0 chain: optionally high-pass filter to remove wind and traffic rumble below 60 to 120 Hz, then hand the audio to the model. A **named scene** does not use that switch. Inside each chunk, Heavy Wind and Highway first repair isolated clicks and low pops (the transient guard). Every named scene then runs an infrasonic filter, ducks gust energy under the scene's split while the fragment is unvoiced, and pulls down a steady idle tone or a confirmed 50/100 Hz hum.
-3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway and Pedestrian Street lower the steady residual floor (the floor gate), all before the crossfade.
+3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway, Pedestrian Street and Conversation lower the steady residual floor (the floor gate). If Dialogue is Gentle or Clear, the consonant band is then lifted. All of that happens before the crossfade.
 4. Resample back to the source rate, optionally peak-normalise, and save a WAV named `<name>_denoised.wav` in the output folder, at the source's bit depth (24-bit for MP3 and OGG).
 5. For A/B playback, the integrated loudness of both versions is measured (ITU-R BS.1770-4) and, if **Match A/B loudness** is on, the denoised copy plays at the original's loudness. The saved file is never touched by this.
 
@@ -106,7 +108,9 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
   "scene": "manual",
   "manual_highpass": "80 Hz",
   "manual_atten_index": 9,
-  "manual_post_filter": false
+  "manual_post_filter": false,
+  "dialogue_lift": "off",
+  "subtitles": false
 }
 ```
 
@@ -119,7 +123,9 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
 | `normalise` | Peak-normalise the saved file to -1.0 dBFS |
 | `loudness_match` | Play A and B at matched integrated loudness. Playback only; missing means on |
 | `last_dir` | Last folder a file was opened from |
-| `scene` | `manual`, `wind`, `traffic`, `street` or `podcast`. Missing or unknown means Manual |
+| `scene` | `manual`, `wind`, `traffic`, `street`, `conversation` or `podcast`. Missing or unknown means Manual |
+| `dialogue_lift` | `off`, `gentle` or `clear`. Missing means the scene's own default (Clear on Conversation, Off on the others) |
+| `subtitles` | Transcribe the denoised audio and show the words during playback. Missing means off |
 | `manual_highpass` | Rumble choice remembered while a named scene is in use. Default `80 Hz` |
 | `manual_atten_index` | Slider position remembered for the return to Manual. Default `9` (maximum) |
 | `manual_post_filter` | Post-filter switch remembered for the return to Manual. Default `false` |
@@ -143,6 +149,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| [1.3.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.3.0) | 28 October 2026 | Conversation (1–5 m), a dialogue lift for talk a few metres away, and optional playback subtitles. Dialogue Off keeps the 1.2.1 sound |
 | [1.2.1](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.1) | 28 October 2026 | Heavy Wind & Gusts and Highway / Traffic Drone render 11-23 % faster; output byte-identical to 1.2.0 |
 | [1.2.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.0) | 28 October 2026 | Transient guard (click and pop repair), floor gate, loudness-matched A/B and source bit-depth export with dithered 16-bit. Fixes the 1.1.0 buffer-edge spike. Manual matches 1.1 exactly |
 | [1.1.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0) | 28 October 2026 | Wind and traffic scene presets: Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean. Manual matches 1.0 exactly |

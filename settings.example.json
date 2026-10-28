@@ -9,5 +9,7 @@
   "scene": "manual",
   "manual_highpass": "80 Hz",
   "manual_atten_index": 9,
-  "manual_post_filter": false
+  "manual_post_filter": false,
+  "dialogue_lift": "off",
+  "subtitles": false
 }

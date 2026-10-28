@@ -12,6 +12,7 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | 1.1.0 | Wind and traffic scene presets | Released 28 October 2026. Has the edge-spike bug fixed in 1.2.0 |
 | 1.2.0 | Transient guard, floor gate, loudness-matched A/B, source bit depth | Released 28 October 2026. Mark's listening check passed 28 October 2026 |
 | 1.2.1 | Faster Heavy Wind and Highway renders, identical output | Released 28 October 2026 |
+| 1.3.0 | Dialogue lift, Conversation (1–5 m), playback subtitles | Released 28 October 2026. Listening check on real 1–5 m speech is still open |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -84,6 +85,24 @@ Done when:
 - [x] Time measured: the stage is 2.5-3.3 times faster, and Heavy Wind and Highway renders 11-23 % faster on this laptop.
 - [x] Mark's go-ahead (28 October 2026): version 1.2.1, `CHANGELOG.md` cut, commit and `v1.2.1` tag. Push and GitHub Release are Mark's.
 - [x] Listening: output is byte-identical to 1.2.0, so Mark's passed 1.2.0 listening check (28 October 2026) holds for 1.2.1.
+
+## 1.3.0 - Dialogue lift, Conversation and subtitles (released 28 October 2026)
+
+Design note: `notes/01_Active/005_dialogue_clarity_and_subtitles.md`, with the implementation review beside it (both local only).
+
+Scope:
+
+- A dialogue lift after the model (Off, Gentle 3 dB, Clear 6 dB). Off is the default on every scene shipped in 1.2.1, so those scenes stay bit-identical when the menu is left alone.
+- Conversation (1–5 m): Pedestrian Street with the post-filter off, a gentler gust duck, a gate that starts at 2.2 kHz, and Dialogue on Clear.
+- Optional subtitles during playback, from wav2vec2-base already in torchaudio, with Save text writing an SRT and a plain transcript. The switch defaults off. No new package.
+
+Done when:
+
+- [x] The change is applied and compiles cleanly (`py_compile`).
+- [x] The two lift constants are measured and frozen: target tilt −23.0 dB, floor bias 1.2.
+- [x] Manual matches 1.1.0 exactly (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three listening clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match on the clips and the 70 s file. The TTS file is 16-bit here and was 24-bit in 1.1, which is the 1.2 export rule.
+- [x] Heavy Wind, Highway, Pedestrian Street and Subtle Podcast Clean, Dialogue Off, match frozen 1.2.0 (the same audio as 1.2.1) on those three clips and the TTS file: 48 kHz buffer and saved file byte-identical, 16 of 16. Conversation rendered on the TTS file without error. That is not a listening check.
+- [ ] Mark's listening check: a real conversation at about 1–5 m, in wind and in traffic, Dialogue Clear against Off, on Conversation and on Highway with the menu set to Clear. Synthetic clips and text-to-speech are not this check.
 
 ## Later
 
