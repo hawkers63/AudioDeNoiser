@@ -4,6 +4,7 @@
   "highpass": "80 Hz",
   "post_filter": false,
   "normalise": true,
+  "loudness_match": true,
   "last_dir": "",
   "scene": "manual",
   "manual_highpass": "80 Hz",

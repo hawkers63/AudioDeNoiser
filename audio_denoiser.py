@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.1
+Audio DeNoiser 1.2
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -28,12 +28,15 @@ How the processing chain works
 2. Manual runs the 1.0 chain: an optional high-pass below 60-120 Hz, then the
    model. A named scene instead conditions each chunk before the model, with an
    infrasonic filter, a gust duck and an idle-tone stage. Heavy Wind and Highway
-   also soften isolated spectral peaks before the chunk crossfade.
+   first repair isolated clicks and low pops (the transient guard).
 3. DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the
    model has settled before its output is used, joined with 0.25 s crossfades.
    Chunking gives a real progress bar, a working Cancel button and flat memory use.
-4. Resample back to the source rate, optionally peak-normalise, and save a
-   24-bit WAV named <name>_denoised.wav in the output folder.
+   After the model, Heavy Wind and Highway soften isolated spectral peaks, and
+   Wind, Highway and Street lower the steady residual floor (the floor gate).
+4. Resample back to the source rate, optionally peak-normalise, and save a WAV
+   named <name>_denoised.wav at the source's bit depth (24-bit for MP3 and OGG).
+5. A/B playback can be loudness-matched (ITU-R BS.1770-4). The file is untouched.
 """
 from __future__ import annotations
 
@@ -62,8 +65,11 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import soundfile as sf
-from scipy.ndimage import median_filter, uniform_filter1d
-from scipy.signal import butter, istft, resample_poly, sosfilt, sosfilt_zi, sosfiltfilt, stft
+from scipy.linalg import LinAlgError, solve_toeplitz, solveh_banded
+from scipy.ndimage import median_filter, minimum_filter1d, uniform_filter1d
+from scipy import fft as sp_fft
+from scipy.signal import (butter, get_window, resample_poly, sosfilt, sosfilt_zi,
+                          sosfiltfilt, stft)
 import tkinter as tk
 from tkinter import filedialog
 import customtkinter as ctk
@@ -80,7 +86,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -96,6 +102,12 @@ PREROLL_SECONDS = 2.0
 CROSSFADE_SECONDS = 0.25
 NORMALISE_PEAK_DBFS = -1.0
 LONG_FILE_MINUTES = 45
+
+# Export keeps the source's bit depth when it has one. Anything else is 24-bit.
+EXPORT_SUBTYPES = ("PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE")
+DEPTH_LABELS = {"PCM_16": "16-bit", "PCM_24": "24-bit", "PCM_32": "32-bit",
+                "FLOAT": "32-bit float", "DOUBLE": "64-bit float"}
+DITHER_SEED = 1770  # fixed, so the same render always writes the same 16-bit file
 
 # Noise-reduction limit steps for the slider. None = no limit (model default).
 ATTEN_STEPS = [6, 9, 12, 15, 18, 24, 30, 40, 60, None]
@@ -166,6 +178,52 @@ VOICE_HIGHBAND_HZ = 280.0
 VOICE_HIGHBAND_MARGIN_DB = 30.0
 VOICING_MIN = 0.33
 
+# Transient guard. A click is short, broadband and sits on an unchanged
+# background. A consonant burst is short too, but it comes out of a closure and
+# runs into aspiration or a vowel, so the sound either side of it differs. A pop
+# is low, brief and unvoiced. Each detector finds the event on a short envelope,
+# checks the sound around it on a longer one, then repairs at sample accuracy.
+CLICK_HP_HZ = 3000.0
+CLICK_HOP = 24                  # 0.5 ms blocks
+CLICK_FINE = 2                  # blocks per window that finds the click (1 ms)
+CLICK_COARSE = 20               # blocks per window that judges its surroundings (10 ms)
+CLICK_MEDIAN_S = 0.100          # running-median background, ±50 ms
+CLICK_DB = 10.0                 # how far a click must stand above the background
+CLICK_EXTENT_DB = 6.0           # the click's own extent on the short envelope
+CLICK_MAX_S = 0.006             # longer than this is speech, not a click
+CLICK_UNIQUE_S = 0.040          # a click also tops every other peak this close...
+CLICK_UNIQUE_DB = 6.0           # ...by this much: glottal pulses, even creaky ones, never do
+CLICK_FLAT_DB = 6.0             # either side must stay this close to its own median
+CLICK_SAMPLE_RATIO = 3.0        # samples this far above the background RMS are the click
+CLICK_MARGIN = 32               # samples added either side, so the fill meets clean audio
+CLICK_AR_ORDER = 48
+CLICK_CONTEXT = 1024            # samples either side used to fit the AR model
+CLICK_GUARD_SPAN = 512          # a fill may not be louder than this much audio either side...
+CLICK_GUARD_DB = 3.0            # ...by more than this
+THUMP_LP_HZ = 200.0
+THUMP_HOP = 120                 # 2.5 ms blocks
+THUMP_FINE = 4                  # 10 ms
+THUMP_COARSE = 16               # 40 ms
+THUMP_MEDIAN_S = 0.200
+THUMP_DB = 14.0
+THUMP_EXTENT_DB = 6.0
+THUMP_MAX_S = 0.060             # longer low-band bursts are gusts, left to the gust duck
+THUMP_FLAT_DB = 8.0             # low-band noise swings more than the high band
+THUMP_MAX_DB = 30.0
+THUMP_VOICE_GUARD_S = 0.030     # no voiced frame this close to a pop we repair
+TRANS_REACH_S = 0.040           # how far either side the surroundings are judged
+TRANS_FLOOR_DBFS = -90.0        # envelopes never read below this, so near-silence can't spike
+TRANS_MAX_EVENTS = 512
+
+# Noise floor gate: minimum statistics with a Wiener-shaped gain.
+GATE_FRAME = 1024
+GATE_HOP = 256                  # 75 % Hann overlap, 5.33 ms
+GATE_SMOOTH_FRAMES = 3
+GATE_FLOOR_BINS = 5             # a broadband floor is smooth across ~230 Hz
+GATE_TRACK_S = 0.6              # longer than a held fricative or vowel
+GATE_BIAS = 3.6                 # minimum-to-RMS on Gaussian noise, for the three lines above
+GATE_OVERSUB = 1.6              # the gain is fully closed within 4 dB of the floor
+
 _SOS_CACHE: dict[tuple, np.ndarray] = {}
 
 
@@ -199,6 +257,10 @@ class ScenePreset:
     floor_hi_hz: float | None
     floor_peak_db: float
     floor_max_db: float
+    transient_guard: bool
+    gate_db: float
+    gate_lo_hz: float | None
+    gate_hi_hz: float | None
 
     @property
     def active(self) -> bool:
@@ -208,12 +270,18 @@ class ScenePreset:
     def uses_floor(self) -> bool:
         return self.floor_lo_hz is not None and self.floor_hi_hz is not None
 
+    @property
+    def uses_gate(self) -> bool:
+        return self.gate_db > 0.0 and self.gate_lo_hz is not None and self.gate_hi_hz is not None
+
 
 class ConditionerState:
-    """Reusable scratch and the slow low-band floor carried across chunks."""
+    """Reusable scratch, the slow low-band floor carried across chunks, and the
+    transients repaired in the most recent chunk as (kind, start sample)."""
 
     def __init__(self) -> None:
         self.low_floor_db: float | None = None
+        self.events: list[tuple[str, int]] = []
         self._scratch: dict[str, np.ndarray] = {}
 
     def buffer(self, name: str, shape: tuple[int, ...]) -> np.ndarray:
@@ -539,25 +607,32 @@ def find_stable_tones(
 
 
 def _istft(spectrum: np.ndarray, sr: int, frame: int, hop: int) -> np.ndarray:
-    """Inverse STFT matching ``_tone_spectrum`` / the spectral floor.
+    """Inverse STFT matching ``_tone_spectrum``, the spectral floor and the gate.
 
-    Scipy warns that the Hann window fails NOLA because its first sample is
-    exactly zero. The overlap itself is the standard 50 percent. The difference
-    method in the callers never replaces samples whose gain is unity, so that
-    endpoint does not touch the speech we meant to leave alone.
+    The same arithmetic as ``scipy.signal.istft`` with a periodic Hann window,
+    no boundary extension and spectrum scaling, but with the overlap-add done a
+    hop-sized block at a time instead of a Python loop over every frame. Each
+    output sample still sums its frames in the same order, so the result is
+    bit-for-bit the same; the frame size must be a whole number of hops.
     """
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="NOLA condition failed")
-        _times, restored = istft(
-            spectrum,
-            fs=sr,
-            window="hann",
-            nperseg=frame,
-            noverlap=frame - hop,
-            boundary=False,
-            input_onesided=True,
-        )
-    return np.asarray(restored, dtype=np.float64)
+    window = get_window("hann", frame)
+    frames = sp_fft.irfft(spectrum, axis=-2, n=frame)[:frame, :]
+    frames *= window.sum()
+    count = frames.shape[1]
+    ratio = frame // hop
+    restored = np.zeros((count + ratio - 1, hop), dtype=frames.dtype)
+    norm = np.zeros((count + ratio - 1, hop), dtype=frames.dtype)
+    weighted = frames * window[:, None]
+    squared = window * window
+    # Frame i lands its block j on output block i + j. Taking j from the top
+    # down adds each output block's frames in rising order, as scipy does.
+    for block in reversed(range(ratio)):
+        part = slice(block * hop, (block + 1) * hop)
+        restored[block:block + count] += weighted[part].T
+        norm[block:block + count] += squared[part]
+    restored = restored.ravel()
+    restored /= np.where(norm.ravel() > 1e-10, norm.ravel(), 1.0)
+    return restored
 
 
 def _apply_spectral_gain(
@@ -567,12 +642,24 @@ def _apply_spectral_gain(
 
     Bins whose delta is zero are not rewritten, so a stage that leaves a bin
     alone cannot smear it through the inverse transform.
+
+    ``delta_gain`` is laid out on the caller's grid: frames of ``audio`` with no
+    boundary padding. The transform here pads ``frame - hop`` zeros in front
+    and a full frame behind, and holds the first and last gain columns across
+    the extra frames, so every sample of the buffer sits under full window
+    overlap. Without that padding the inverse STFT divides by a window sum
+    close to zero at the buffer edges, and any gain that is not flat across
+    frequency comes out as a spike at the start and end of the buffer.
     """
     length = audio.shape[-1]
+    lead = frame - hop
+    shift = lead // hop
     cleaned = np.empty(audio.shape, dtype=np.float64)
     for channel in range(audio.shape[0]):
+        padded = np.concatenate((
+            np.zeros(lead), np.asarray(audio[channel], dtype=np.float64), np.zeros(frame)))
         _frequencies, _times, spectrum = stft(
-            np.ascontiguousarray(audio[channel], dtype=np.float64),
+            padded,
             fs=sr,
             window="hann",
             nperseg=frame,
@@ -580,14 +667,14 @@ def _apply_spectral_gain(
             boundary=None,
             padded=False,
         )
-        times = min(spectrum.shape[1], delta_gain.shape[1])
+        columns = np.clip(np.arange(spectrum.shape[1]) - shift, 0, delta_gain.shape[1] - 1)
         bins = min(spectrum.shape[0], delta_gain.shape[0])
         shaped = np.zeros_like(spectrum)
-        shaped[:bins, :times] = spectrum[:bins, :times] * delta_gain[:bins, :times]
-        restored = _istft(shaped, sr, frame, hop)
+        shaped[:bins] = spectrum[:bins] * delta_gain[:bins][:, columns]
+        restored = _istft(shaped, sr, frame, hop)[lead:lead + length]
         if restored.shape[0] < length:
             restored = np.pad(restored, (0, length - restored.shape[0]))
-        cleaned[channel] = audio[channel] + restored[:length]
+        cleaned[channel] = audio[channel] + restored
     if not np.isfinite(cleaned).all():
         raise ValueError("Spectral gain produced invalid samples.")
     return cleaned
@@ -661,33 +748,55 @@ def suppress_stable_tones(
 
 
 def _protect_harmonics(
-    f0_hz: np.ndarray, periodicity: np.ndarray, n_bins: int, n_times: int, sr: int
+    f0_hz: np.ndarray,
+    periodicity: np.ndarray,
+    n_bins: int,
+    n_times: int,
+    sr: int,
+    frame: int = FLOOR_FRAME,
+    top_hz: float | None = None,
 ) -> np.ndarray:
-    """Mark bins that sit on a voiced harmonic, plus one bin either side."""
+    """Mark bins that sit on a voiced harmonic, plus one bin either side.
+
+    ``frame`` is the FFT size of the caller's grid. Without ``top_hz`` the
+    first 16 harmonics are marked; with it, every harmonic up to that frequency.
+    """
     protect = np.zeros((n_bins, n_times), dtype=bool)
     times = min(n_times, f0_hz.shape[0], periodicity.shape[0])
     if times == 0:
         return protect
-    bin_hz = sr / FLOOR_FRAME
+    bin_hz = sr / frame
     valid = periodicity[:times] >= VOICING_MIN
     if not np.any(valid):
         return protect
     time_index = np.arange(times)
     usable = np.flatnonzero(valid)
-    for harmonic in range(1, 17):
-        centres = np.rint(harmonic * f0_hz[:times] / bin_hz).astype(np.int32)
+    count = 16 if top_hz is None else int(math.ceil(top_hz / F0_MIN_HZ))
+    for harmonic in range(1, count + 1):
+        frequency = harmonic * f0_hz[:times][usable]
+        keep = usable if top_hz is None else usable[frequency <= top_hz]
+        if keep.size == 0:
+            break
+        centres = np.rint(harmonic * f0_hz[:times][keep] / bin_hz).astype(np.int32)
         for offset in (-1, 0, 1):
-            index = np.clip(centres[usable] + offset, 0, n_bins - 1)
-            protect[index, time_index[usable]] = True
+            index = np.clip(centres + offset, 0, n_bins - 1)
+            protect[index, time_index[keep]] = True
     return protect
 
 
-def soften_musical_noise(audio: np.ndarray, sr: int, preset: ScenePreset) -> np.ndarray:
+def soften_musical_noise(
+    audio: np.ndarray,
+    sr: int,
+    preset: ScenePreset,
+    voicing: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     """Pull isolated spectral peaks in the tyre band down towards the local median.
 
     Unity gains return the input unchanged, so speech that the detector leaves
     alone is not passed through an inverse STFT at all. Harmonics of a detected
     f0 are marked and left alone, which keeps vowels from being chiselled out.
+    ``voicing`` is (debounced periodicity, f0) for this audio, when the caller
+    has already measured it; otherwise it is measured here.
     """
     if not preset.uses_floor:
         return audio
@@ -713,8 +822,11 @@ def soften_musical_noise(audio: np.ndarray, sr: int, preset: ScenePreset) -> np.
         np.arange(magnitude.shape[0]) <= preset.floor_hi_hz / bin_hz
     )
     pull_db *= band[:, None]
-    periodicity, f0 = estimate_voicing(mid, sr)
-    periodicity = _debounce_voicing(periodicity)
+    if voicing is None:
+        periodicity, f0 = estimate_voicing(mid, sr)
+        periodicity = _debounce_voicing(periodicity)
+    else:
+        periodicity, f0 = voicing
     # estimate_voicing hops by VOICE_HOP; the floor STFT hops by FLOOR_HOP.
     # Resample the f0 track onto the STFT grid with a nearest hold.
     if f0.size:
@@ -739,6 +851,408 @@ def soften_musical_noise(audio: np.ndarray, sr: int, preset: ScenePreset) -> np.
         return audio
 
     return _apply_spectral_gain(audio, sr, gain - 1.0, FLOOR_FRAME, FLOOR_HOP)
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous stretches of ``True``, as half-open (first, last) index pairs."""
+    if not mask.any():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))
+    return list(zip(edges[0::2].tolist(), edges[1::2].tolist()))
+
+
+def _block_power(signal: np.ndarray, hop: int) -> np.ndarray:
+    """Mean power of consecutive ``hop``-sample blocks."""
+    count = signal.shape[0] // hop
+    blocks = signal[: count * hop].reshape(count, hop)
+    return np.mean(blocks * blocks, axis=1)
+
+
+def _window_db(power: np.ndarray, width: int) -> np.ndarray:
+    """Level in dB of windows ``width`` blocks long; entry ``k`` starts at block ``k``.
+
+    Direct sums rather than a running total, so a quiet passage after a loud
+    one is not lost to rounding. The level never reads below
+    ``TRANS_FLOOR_DBFS``: in a band that is all but empty, the flicker of the
+    last few bits would otherwise look like a click.
+    """
+    if power.shape[0] < width:
+        return np.zeros(0, dtype=np.float64)
+    total = np.convolve(power, np.ones(width), mode="valid")
+    return 10.0 * np.log10(total / width + 10.0 ** (TRANS_FLOOR_DBFS / 10.0))
+
+
+def _steady_around(coarse_db: np.ndarray, width: int, first: int, end: int,
+                   reach: int, tolerance_db: float) -> bool:
+    """True when the sound either side of blocks ``first:end`` holds steady.
+
+    Only windows that do not overlap the event are judged: ``reach`` blocks of
+    them on each side. Each must lie within ``tolerance_db`` of their median,
+    so there is no onset, offset or second burst nearby. Too close to either
+    end of the buffer to see both sides counts as not steady.
+    """
+    lo = first - width - reach
+    if lo < 0 or end + reach + 1 > coarse_db.shape[0]:
+        return False
+    around = np.concatenate((coarse_db[lo:first - width + 1], coarse_db[end:end + reach + 1]))
+    reference = float(np.median(around))
+    return bool(around.max() <= reference + tolerance_db
+                and around.min() >= reference - tolerance_db)
+
+
+def detect_clicks(mono: np.ndarray, sr: int) -> list[tuple[int, int]]:
+    """Sample ranges holding an isolated click, tick or knock.
+
+    The band above ``CLICK_HP_HZ`` is measured in 1 ms windows and compared with
+    its own 100 ms running median. A click stands at least ``CLICK_DB`` above it
+    for no more than a few milliseconds, and tops every other peak within
+    40 ms by ``CLICK_UNIQUE_DB``: voiced speech puts a burst into this band at
+    every glottal closure, but those come in a train of near-equals. The sound
+    in 10 ms windows for 40 ms either side must also hold steady. A plosive
+    burst fails that, because it comes out of a closure and runs into
+    aspiration or a vowel. The range is then narrowed to the samples that
+    carry the click, so the repair does not reach into the speech around it.
+    """
+    if mono.shape[0] < sr // 5:
+        return []
+    high = _safe_filtfilt(mono[None, :], _sos("high", sr, CLICK_HP_HZ, order=4))[0]
+    power = _block_power(high, CLICK_HOP)
+    level = _window_db(power, CLICK_FINE)
+    coarse = _window_db(power, CLICK_COARSE)
+    if coarse.size < 8:
+        return []
+    size = int(round(CLICK_MEDIAN_S * sr / CLICK_HOP)) | 1
+    background = median_filter(level, size=size, mode="nearest")
+    excess = level - background
+    longest = int(round(CLICK_MAX_S * sr / CLICK_HOP))
+    reach = int(round(TRANS_REACH_S * sr / CLICK_HOP))
+    nearby = int(round(CLICK_UNIQUE_S * sr / CLICK_HOP))
+    events: list[tuple[int, int]] = []
+    for first, last in _runs(excess > CLICK_EXTENT_DB):
+        peak = float(excess[first:last].max())
+        if last - first > longest or peak < CLICK_DB:
+            continue
+        # One window either side of the run is left out of the comparison:
+        # it overlaps the click itself.
+        others = np.concatenate((excess[max(0, first - nearby):max(0, first - 1)],
+                                 excess[last + 1:last + nearby]))
+        if others.size and peak < float(others.max()) + CLICK_UNIQUE_DB:
+            continue
+        # Fine window k spans blocks k and k + 1, so the run spans blocks first..last.
+        if not _steady_around(coarse, CLICK_COARSE, first, last + CLICK_FINE - 1,
+                              reach, CLICK_FLAT_DB):
+            continue
+        lo = first * CLICK_HOP
+        hi = min(mono.shape[0], (last + CLICK_FINE - 1) * CLICK_HOP)
+        floor_rms = math.sqrt(10.0 ** (float(np.median(background[first:last])) / 10.0))
+        loud = np.flatnonzero(np.abs(high[lo:hi]) > CLICK_SAMPLE_RATIO * floor_rms)
+        if loud.size == 0:
+            continue
+        start = max(0, lo + int(loud[0]) - CLICK_MARGIN)
+        end = min(mono.shape[0], lo + int(loud[-1]) + 1 + CLICK_MARGIN)
+        events.append((start, end))
+        if len(events) >= TRANS_MAX_EVENTS:
+            break
+    return events
+
+
+def _ar_predictor(pieces: list[np.ndarray], order: int, correction: float) -> np.ndarray | None:
+    """Prediction-error filter ``[1, -a1, ..., -ap]`` fitted to the given pieces.
+
+    Each piece is Hann-windowed and its autocorrelation added in, so the gap
+    between them never enters the fit. ``correction`` adds that fraction of
+    white noise, which caps how deep the model's spectral valleys can go.
+    ``None`` means there is nothing to model, which only happens in digital
+    silence. Raises ``LinAlgError`` if the model cannot be fitted.
+    """
+    autocorr = np.zeros(order + 1)
+    for piece in pieces:
+        if piece.shape[0] <= order:
+            continue
+        windowed = piece * np.hanning(piece.shape[0])
+        spectrum = np.fft.rfft(windowed, n=2 * piece.shape[0])
+        autocorr += np.fft.irfft(spectrum.real ** 2 + spectrum.imag ** 2)[: order + 1]
+    if autocorr[0] <= 1e-20:
+        return None
+    autocorr[0] *= 1.0 + correction
+    predictor = solve_toeplitz(autocorr[:order], autocorr[1:])
+    if not np.isfinite(predictor).all():
+        raise LinAlgError("The AR model could not be fitted around this gap.")
+    return np.concatenate(([1.0], -predictor))
+
+
+def _lsar_solve(samples: np.ndarray, start: int, end: int, order: int,
+                context: int, correction: float, ridge: float) -> np.ndarray:
+    """The LSAR fill for ``samples[start:end]``, without writing it.
+
+    The normal equations for the gap are banded (bandwidth ``order``) and
+    positive definite, so a banded Cholesky solve is both fast and stable.
+    ``ridge`` adds that fraction of the diagonal, which pulls the fill towards
+    silence wherever the model leaves it free to swing.
+    """
+    gap = end - start
+    coeffs = _ar_predictor(
+        [samples[max(0, start - context):start], samples[end:end + context]], order, correction)
+    if coeffs is None:
+        return np.zeros(gap)
+    segment = np.array(samples[start - order:end + order], dtype=np.float64)
+    segment[order:order + gap] = 0.0
+    # Prediction error of the known samples alone, then its correlation with
+    # the filter: the right-hand side of the normal equations for the gap.
+    known_error = np.convolve(segment, coeffs, mode="valid")
+    rhs = np.correlate(known_error, coeffs, mode="valid")
+    autocorr = np.correlate(coeffs, coeffs, mode="full")[order:]
+    upper = min(order, gap - 1)
+    banded = np.zeros((upper + 1, gap))
+    for offset in range(upper + 1):
+        banded[upper - offset, offset:] = autocorr[offset]
+    banded[upper] += ridge * autocorr[0]
+    return -solveh_banded(banded, rhs)
+
+
+def _lsar_fill(samples: np.ndarray, start: int, end: int,
+               order: int = CLICK_AR_ORDER, context: int = CLICK_CONTEXT) -> bool:
+    """Least-squares autoregressive interpolation of ``samples[start:end]``, in place.
+
+    An AR model is fitted to the audio either side of the gap, and the missing
+    samples are the ones that make the model's prediction error across the gap
+    as small as possible (Janssen, Veldhuis and Vries, 1986). Unlike a smooth
+    curve, the fill carries on the waveform's texture, the harmonics of a vowel
+    or the grain of the noise around it.
+
+    In narrow-band noise the model has deep spectral valleys, and anything at
+    the gap's edges that the model cannot explain can drive the fill far above
+    its surroundings. So a fill louder than the audio either side by more than
+    ``CLICK_GUARD_DB`` is replaced by a heavily regularised one, which errs
+    towards a brief dip. Returns False, leaving the samples alone, when there
+    is too little audio either side or neither fill passes.
+    """
+    gap = end - start
+    if gap <= 0 or start < max(order, CLICK_GUARD_SPAN) + 32:
+        return False
+    if end + max(order, CLICK_GUARD_SPAN) + 32 > samples.shape[0]:
+        return False
+    side = max(float(np.sqrt(np.mean(np.square(samples[start - CLICK_GUARD_SPAN:start])))),
+               float(np.sqrt(np.mean(np.square(samples[end:end + CLICK_GUARD_SPAN])))))
+    if side == 0.0:
+        samples[start:end] = 0.0  # a click in digital silence
+        return True
+    ceiling = side * 10.0 ** (CLICK_GUARD_DB / 20.0)
+    for correction, ridge in ((1e-6, 0.0), (1e-3, 1e-2)):
+        try:
+            fill = _lsar_solve(samples, start, end, order, context, correction, ridge)
+        except LinAlgError:
+            continue
+        if np.isfinite(fill).all() and float(np.sqrt(np.mean(fill * fill))) <= ceiling:
+            samples[start:end] = fill
+            return True
+    return False
+
+
+def detect_thumps(
+    mono: np.ndarray, sr: int, periodicity: np.ndarray
+) -> list[tuple[int, np.ndarray]]:
+    """Low pops that sit in a pause or under unvoiced sound.
+
+    Returns, for each pop, the first sample of the span to treat and the gain
+    for the band below ``THUMP_LP_HZ`` across that span. The gain follows the
+    pop's excess over the band's running median, so the band comes back to
+    where it was before the pop. A pop within 30 ms of a voiced frame is left
+    alone: that band is also where a speaking fundamental lives. Low bursts
+    longer than ``THUMP_MAX_S``, or in low-band sound that does not hold steady
+    around them, are gusts, and stay with the gust duck.
+    """
+    if mono.shape[0] < sr // 2 or periodicity.size == 0:
+        return []
+    low = _safe_filtfilt(mono[None, :], _sos("low", sr, THUMP_LP_HZ, order=4))[0]
+    power = _block_power(low, THUMP_HOP)
+    level = _window_db(power, THUMP_FINE)
+    coarse = _window_db(power, THUMP_COARSE)
+    if coarse.size < 8:
+        return []
+    size = int(round(THUMP_MEDIAN_S * sr / THUMP_HOP)) | 1
+    excess = level - median_filter(level, size=size, mode="nearest")
+    longest = int(round(THUMP_MAX_S * sr / THUMP_HOP))
+    reach = int(round(TRANS_REACH_S * sr / THUMP_HOP))
+    guard = THUMP_VOICE_GUARD_S * sr
+    voiced = periodicity >= VOICING_MIN
+    events: list[tuple[int, np.ndarray]] = []
+    for first, last in _runs(excess > THUMP_EXTENT_DB):
+        if last - first > longest or excess[first:last].max() < THUMP_DB:
+            continue
+        if not _steady_around(coarse, THUMP_COARSE, first, last + THUMP_FINE - 1,
+                              reach, THUMP_FLAT_DB):
+            continue
+        # Voicing frame i is centred on i * VOICE_HOP + VOICE_FRAME / 2.
+        lo, hi = first * THUMP_HOP, (last + THUMP_FINE - 1) * THUMP_HOP
+        v0 = max(0, int(math.ceil((lo - guard - VOICE_FRAME / 2) / VOICE_HOP)))
+        v1 = min(voiced.size, int(math.floor((hi + guard - VOICE_FRAME / 2) / VOICE_HOP)) + 1)
+        if v1 <= v0 or voiced[v0:v1].any():
+            continue
+        # Cut by the excess, window by window, softened by one window each side.
+        span_lo, span_hi = max(0, first - 2), min(level.size, last + 2)
+        cut_db = np.zeros(span_hi - span_lo)
+        cut_db[first - span_lo:last - span_lo] = np.clip(excess[first:last], 0.0, THUMP_MAX_DB)
+        cut_db = np.maximum(uniform_filter1d(cut_db, size=3, mode="constant"), 0.0)
+        centres = (np.arange(span_lo, span_hi) * THUMP_HOP
+                   + THUMP_FINE * THUMP_HOP // 2).astype(np.float64)
+        start = int(centres[0])
+        end = min(mono.shape[0], int(centres[-1]) + 1)
+        cut = np.interp(np.arange(start, end), centres, cut_db, left=0.0, right=0.0)
+        events.append((start, np.power(10.0, -cut / 20.0)))
+        if len(events) >= TRANS_MAX_EVENTS:
+            break
+    return events
+
+
+def _duck_low_band(samples: np.ndarray, start: int, gain: np.ndarray, sr: int) -> None:
+    """Lower the band under ``THUMP_LP_HZ`` by ``gain`` across one span, in place.
+
+    The low band is a zero-phase low-pass, so the signal minus it is exactly
+    the rest of the spectrum, and subtracting ``(1 - gain)`` of it touches
+    nothing outside the span or above the band.
+    """
+    end = start + gain.shape[0]
+    pad = sr // 10
+    lo, hi = max(0, start - pad), min(samples.shape[0], end + pad)
+    low = _safe_filtfilt(samples[None, lo:hi], _sos("low", sr, THUMP_LP_HZ, order=4))[0]
+    samples[start:end] -= (1.0 - gain) * low[start - lo:end - lo]
+
+
+def repair_transients(
+    audio: np.ndarray, sr: int, periodicity: np.ndarray
+) -> tuple[np.ndarray, list[tuple[str, int]]]:
+    """Repair isolated clicks and low pops on the dry chunk, in every channel.
+
+    ``audio`` must be the caller's own float64 copy: it is repaired in place.
+    Detection runs on the mono mix and each repair uses the same indices in
+    every channel, so the stereo image holds. Runs before the infrasonic
+    filter, because a zero-phase filter smears a click across tens of
+    milliseconds. Returns the audio and the repairs, as (kind, start sample).
+    """
+    mono = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    clicks = detect_clicks(mono, sr)
+    thumps = detect_thumps(mono, sr, periodicity)
+    repaired: list[tuple[str, int]] = []
+    for start, end in clicks:
+        if all(_lsar_fill(audio[channel], start, end) for channel in range(audio.shape[0])):
+            repaired.append(("click", start))
+    for start, gain in thumps:
+        for channel in range(audio.shape[0]):
+            _duck_low_band(audio[channel], start, gain, sr)
+        repaired.append(("pop", start))
+    return audio, repaired
+
+
+def _noise_floor_track(magnitude: np.ndarray, sr: int) -> np.ndarray:
+    """Per-bin noise floor: the minimum of the smoothed magnitude, bias-corrected.
+
+    Smoothing first stops a single dropout from becoming the floor. The sliding
+    minimum over ``GATE_TRACK_S`` then finds each bin's quietest moment, which
+    is the noise as long as no speech sound holds a bin for that long, and the
+    minima of neighbouring bins are averaged, which halves their scatter. The
+    minimum of a noisy magnitude sits well below its RMS; ``GATE_BIAS`` puts it
+    back, and was measured on Gaussian noise through this exact tracker (3.61).
+    """
+    window = max(3, int(round(GATE_TRACK_S * sr / GATE_HOP)))
+    window = min(window, magnitude.shape[1])
+    smoothed = uniform_filter1d(magnitude, size=GATE_SMOOTH_FRAMES, axis=1, mode="nearest")
+    floor = minimum_filter1d(smoothed, size=window, axis=1, mode="nearest")
+    floor = uniform_filter1d(floor, size=GATE_FLOOR_BINS, axis=0, mode="nearest")
+    return np.maximum(floor, 0.0) * GATE_BIAS
+
+
+def apply_noise_floor_gate(
+    audio: np.ndarray,
+    sr: int,
+    preset: ScenePreset,
+    voicing: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Lower the steady residual floor in the scene's band, voiced harmonics kept.
+
+    This is not the peak suppressor in ``soften_musical_noise``: it tracks the
+    broadband wash the network leaves behind under its blend limit, and pulls
+    it down by up to ``gate_db``. The gain is Wiener-shaped. It is fully closed
+    within 4 dB of the floor, and within 0.2 dB of unity 20 dB above it. Bins
+    on a voiced harmonic, and one either side, are forced back to unity, so a
+    vowel's harmonics come back bit-for-bit. ``voicing`` is (debounced
+    periodicity, f0) for this audio, when the caller has already measured it.
+    """
+    if not preset.uses_gate or audio.shape[-1] < GATE_FRAME * 4:
+        return audio
+    mono = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    gain = _gate_gain(mono, sr, preset, voicing)
+    if gain is None:
+        return audio
+    return _apply_spectral_gain(audio, sr, gain - 1.0, GATE_FRAME, GATE_HOP)
+
+
+def _gate_gain(
+    mono: np.ndarray,
+    sr: int,
+    preset: ScenePreset,
+    voicing: tuple[np.ndarray, np.ndarray] | None,
+) -> np.ndarray | None:
+    """The floor gate's gain on the GATE_FRAME grid, or None when it is unity.
+
+    Rows stop just above the band: rows past the end of a gain array are left
+    untouched by ``_apply_spectral_gain``, so they need not be stored.
+    """
+    _freqs, _times, mono_spectrum = stft(
+        mono,
+        fs=sr,
+        window="hann",
+        nperseg=GATE_FRAME,
+        noverlap=GATE_FRAME - GATE_HOP,
+        boundary=None,
+        padded=False,
+    )
+    bin_hz = sr / GATE_FRAME
+    first = max(1, int(math.floor(preset.gate_lo_hz / bin_hz)))
+    last = min(mono_spectrum.shape[0], int(math.ceil(preset.gate_hi_hz / bin_hz)) + 1)
+    if last - first < 2:
+        return None
+    rows = min(mono_spectrum.shape[0], last + 1)
+    band = np.abs(mono_spectrum[first:last])
+    floor = _noise_floor_track(band, sr)
+    # The level is the power over 3 frames by 3 bins. A raw bin's magnitude
+    # swings by ±5 dB on steady noise; averaged, the noise rarely reaches the
+    # opening threshold, while speech, which fills neighbouring bins, still does.
+    # The filter's running sum can dip a hair below zero in digital silence.
+    level = np.sqrt(np.maximum(uniform_filter1d(
+        uniform_filter1d(band * band, size=3, axis=1, mode="nearest"),
+        size=3, axis=0, mode="nearest"), 0.0))
+    closeness = GATE_OVERSUB * floor / np.maximum(level, 1e-12)
+    wiener = np.clip(1.0 - closeness * closeness, 0.0, 1.0)
+    floor_gain = 10.0 ** (-preset.gate_db / 20.0)
+    gain = np.ones((rows, band.shape[1]), dtype=np.float64)
+    gain[first:last] = floor_gain + (1.0 - floor_gain) * wiener
+
+    if voicing is None:
+        periodicity, f0 = estimate_voicing(mono, sr)
+        periodicity = _debounce_voicing(periodicity)
+    else:
+        periodicity, f0 = voicing
+    if f0.size:
+        source = np.arange(f0.size) * VOICE_HOP + VOICE_FRAME / 2
+        target = np.arange(gain.shape[1]) * GATE_HOP + GATE_FRAME / 2
+        f0_on_grid = np.interp(target, source, f0, left=f0[0], right=f0[-1])
+        period_on_grid = np.interp(
+            target, source, periodicity, left=periodicity[0], right=periodicity[-1])
+        protect = _protect_harmonics(
+            f0_on_grid, period_on_grid, rows, gain.shape[1], sr,
+            frame=GATE_FRAME, top_hz=preset.gate_hi_hz)
+        gain = np.where(protect, 1.0, gain)
+
+    gain = uniform_filter1d(gain, size=3, axis=0, mode="nearest")
+    gain = uniform_filter1d(gain, size=3, axis=1, mode="nearest")
+    gain = np.clip(gain, floor_gain, 1.0)
+    # Snap near-unity gains, so a region the gate leaves alone comes back
+    # byte-for-byte through the difference form rather than an inverse STFT.
+    gain = np.where(gain > 0.995, 1.0, gain)
+    if np.all(gain > 0.999):
+        return None
+    return gain
 
 
 def apply_scene(
@@ -766,12 +1280,17 @@ def apply_scene(
         state = ConditionerState()
 
     # Voicing is measured on the dry chunk. The steep infrasonic filter rings,
-    # and that ring can look like a vowel if it is measured afterwards.
+    # and that ring can look like a vowel if it is measured afterwards. Clicks
+    # do not disturb it (an impulse has no period), and the pop detector needs
+    # it to keep away from voiced speech, so it is measured before the repair.
     dry = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
     periodicity, _f0 = estimate_voicing(dry, sr)
     periodicity = _debounce_voicing(periodicity)
 
     work = np.array(audio, dtype=np.float64, copy=True)
+    state.events = []
+    if preset.transient_guard:
+        work, state.events = repair_transients(work, sr, periodicity)
     if preset.infrasonic_hz is not None:
         work = _safe_filtfilt(work, _sos("high", sr, preset.infrasonic_hz, order=4))
     if preset.gust_split_hz is not None:
@@ -807,6 +1326,10 @@ def _preset(**overrides) -> ScenePreset:
         floor_hi_hz=None,
         floor_peak_db=8.0,
         floor_max_db=6.0,
+        transient_guard=False,
+        gate_db=0.0,
+        gate_lo_hz=None,
+        gate_hi_hz=None,
     )
     base.update(overrides)
     return ScenePreset(**base)
@@ -816,7 +1339,7 @@ WIND = _preset(
     key="wind",
     label="Heavy Wind & Gusts",
     summary=(
-        "Strips infrasonic buffeting, then ducks gusts under 220 Hz only while the voice is unvoiced."
+        "Repairs clicks and pops, strips infrasonic buffeting, and ducks unvoiced gusts under 220 Hz."
     ),
     atten_db=30,
     post_filter=True,
@@ -832,11 +1355,15 @@ WIND = _preset(
     floor_hi_hz=5000.0,
     floor_peak_db=10.0,
     floor_max_db=4.0,
+    transient_guard=True,
+    gate_db=10.0,
+    gate_lo_hz=1200.0,
+    gate_hi_hz=6000.0,
 )
 TRAFFIC = _preset(
     key="traffic",
     label="Highway / Traffic Drone",
-    summary="Tames road rumble and steady engine tones, and softens the tyre-hiss floor.",
+    summary="Repairs clicks, tames rumble and engine tones, and gates the tyre-hiss wash.",
     atten_db=24,
     post_filter=True,
     post_filter_beta=0.05,
@@ -855,11 +1382,15 @@ TRAFFIC = _preset(
     floor_hi_hz=4000.0,
     floor_peak_db=8.0,
     floor_max_db=6.0,
+    transient_guard=True,
+    gate_db=12.0,
+    gate_lo_hz=800.0,
+    gate_hi_hz=6000.0,
 )
 STREET = _preset(
     key="street",
     label="Pedestrian Street",
-    summary="Light low-end control for street talk, without chewing consonants or nearby voices.",
+    summary="Light low-end control and a gentle hiss gate, without chewing consonants or nearby voices.",
     atten_db=18,
     post_filter=True,
     post_filter_beta=0.02,
@@ -874,6 +1405,9 @@ STREET = _preset(
     notch_hi_hz=200.0,
     notch_max_db=8.0,
     notch_max_count=2,
+    gate_db=8.0,
+    gate_lo_hz=1500.0,
+    gate_hi_hz=6000.0,
 )
 PODCAST = _preset(
     key="podcast",
@@ -911,6 +1445,115 @@ def peak_normalise(audio: np.ndarray, peak_dbfs: float) -> tuple[np.ndarray, flo
     return (audio * gain).astype(np.float32), 20 * math.log10(gain)
 
 
+# K-weighting for 48 kHz (ITU-R BS.1770-4): the high shelf, then the RLB high-pass.
+_K_WEIGHTING = np.array([
+    [1.53512485958697, -2.69169618940638, 1.19839281085285,
+     1.0, -1.69065929318241, 0.73248077421585],
+    [1.0, -2.0, 1.0, 1.0, -1.99004745483398, 0.99007225036621],
+])
+LOUDNESS_STEP_S = 0.1           # blocks are four steps (400 ms) with 75 % overlap
+LOUDNESS_ABSOLUTE_GATE = -70.0
+LOUDNESS_RELATIVE_GATE = -10.0
+LOUDNESS_MATCH_MAX_DB = 12.0
+
+
+def integrated_loudness(audio: np.ndarray, sr: int = MODEL_SR) -> float:
+    """Gated integrated loudness in LUFS (ITU-R BS.1770-4), or -inf.
+
+    Audio is (channels, frames) at 48 kHz, each channel weighted 1.0 as for
+    mono and stereo. The K-weighted energy is summed in 100 ms steps, a minute
+    at a time with the filter state carried over, so a 45-minute file never
+    needs a float64 copy of itself. -inf means there was nothing to measure:
+    under 400 ms of audio, or nothing above the -70 LUFS gate.
+    """
+    if sr != MODEL_SR or audio.ndim != 2:
+        return float("-inf")
+    step = int(round(LOUDNESS_STEP_S * sr))
+    steps = audio.shape[-1] // step
+    if steps < 4:
+        return float("-inf")
+    energy = np.zeros(steps, dtype=np.float64)
+    state = np.zeros((_K_WEIGHTING.shape[0], audio.shape[0], 2))
+    span = 600 * step
+    for first in range(0, steps * step, span):
+        last = min(first + span, steps * step)
+        weighted, state = sosfilt(
+            _K_WEIGHTING, np.asarray(audio[:, first:last], dtype=np.float64), axis=-1, zi=state)
+        squares = np.sum(weighted * weighted, axis=0)
+        energy[first // step:last // step] = squares.reshape(-1, step).sum(axis=1)
+    blocks = (energy[:-3] + energy[1:-2] + energy[2:-1] + energy[3:]) / (4 * step)
+    with np.errstate(divide="ignore"):
+        loudness = -0.691 + 10.0 * np.log10(blocks)
+    keep = loudness > LOUDNESS_ABSOLUTE_GATE
+    if not keep.any():
+        return float("-inf")
+    relative = -0.691 + 10.0 * math.log10(float(np.mean(blocks[keep]))) + LOUDNESS_RELATIVE_GATE
+    keep &= loudness > relative
+    if not keep.any():
+        return float("-inf")
+    return float(-0.691 + 10.0 * math.log10(float(np.mean(blocks[keep]))))
+
+
+def loudness_match_gains(
+    original_lufs: float, denoised_lufs: float, denoised_peak: float
+) -> tuple[float, float, float] | None:
+    """Playback gains (original, denoised, match in dB) that make A and B equally loud.
+
+    The denoised copy moves to the original's integrated loudness, by no more
+    than ``LOUDNESS_MATCH_MAX_DB``. If that would push its peak past full
+    scale, both copies are lowered together by the overshoot, so they stay
+    matched and neither clips. ``None`` means one of them could not be measured.
+    """
+    if not (math.isfinite(original_lufs) and math.isfinite(denoised_lufs)):
+        return None
+    match_db = float(np.clip(original_lufs - denoised_lufs,
+                             -LOUDNESS_MATCH_MAX_DB, LOUDNESS_MATCH_MAX_DB))
+    denoised_gain = 10.0 ** (match_db / 20.0)
+    trim = 1.0
+    if denoised_peak * denoised_gain > 1.0:
+        trim = 1.0 / (denoised_peak * denoised_gain)
+    return trim, denoised_gain * trim, match_db
+
+
+def source_subtype(path: str) -> str | None:
+    """The WAV subtype that keeps the source's bit depth, or None if it has none.
+
+    WAV and FLAC carry a real depth. MP3 and OGG decode to floating point with
+    no depth to keep, and unusual WAV encodings (8-bit, A-law) are not worth
+    keeping; all of those are saved as 24-bit.
+    """
+    try:
+        subtype = sf.info(path).subtype
+    except Exception:
+        return None
+    return subtype if subtype in EXPORT_SUBTYPES else None
+
+
+def write_wav(path: Path, audio: np.ndarray, sr: int, subtype: str) -> None:
+    """Write (channels, frames) audio in [-1, 1] as a WAV of the given subtype.
+
+    16-bit output is rounded here, with TPDF dither of one LSB either way, so
+    the quiet tails a denoiser leaves fade into noise rather than distortion.
+    libsndfile alone floors every sample with no dither. It is written a block
+    at a time, so a long file never needs a second full-size copy. Deeper
+    formats go through libsndfile exactly as in 1.1.
+    """
+    if subtype != "PCM_16":
+        sf.write(str(path), audio.T, sr, subtype=subtype)
+        return
+    rng = np.random.default_rng(DITHER_SEED)
+    block = 1 << 20
+    with sf.SoundFile(str(path), "w", samplerate=sr, channels=audio.shape[0],
+                      subtype="PCM_16", format="WAV") as handle:
+        for first in range(0, audio.shape[1], block):
+            piece = np.asarray(audio[:, first:first + block].T, dtype=np.float32) * 32768.0
+            piece += rng.random(piece.shape, dtype=np.float32)
+            piece -= rng.random(piece.shape, dtype=np.float32)
+            np.rint(piece, out=piece)
+            np.clip(piece, -32768.0, 32767.0, out=piece)
+            handle.write(piece.astype(np.int16))
+
+
 def load_model():
     """Import torch/DeepFilterNet lazily (slow) and load the DFN3 model."""
     import torch
@@ -926,12 +1569,15 @@ def load_model():
 
 def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
             scene: ScenePreset | None = None,
-            progress=None, cancel: threading.Event | None = None) -> np.ndarray:
+            progress=None, cancel: threading.Event | None = None,
+            stats: dict | None = None) -> np.ndarray:
     """Run DeepFilterNet over 48 kHz audio (channels, frames) in overlapping chunks.
 
     A named scene conditions each extended chunk before the network sees it.
     Manual passes the audio through unchanged, so today's slider and rumble
     settings keep today's results. The torch tensor is one chunk, not the file.
+    ``stats``, if given, gains "clicks" and "pops": the transients repaired,
+    each counted once, in the chunk whose output keeps it.
     """
     import torch
     from df.enhance import enhance
@@ -961,7 +1607,13 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
 
         segment = np.ascontiguousarray(audio[:, pre_start:tail], dtype=np.float32)
         if active:
+            state.events = []
             segment = apply_scene(segment, sr, scene, state)
+            if stats is not None:
+                for kind, at in state.events:
+                    if start <= pre_start + at < end:
+                        key = "clicks" if kind == "click" else "pops"
+                        stats[key] = stats.get(key, 0) + 1
         if cancel is not None and cancel.is_set():
             raise Cancelled()
         if hasattr(df_state, "reset"):
@@ -970,10 +1622,21 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
             enhanced = enhance(
                 model, df_state, torch.from_numpy(segment), atten_lim_db=atten_lim_db)
         piece = np.ascontiguousarray(enhanced.detach().cpu().numpy(), dtype=np.float32)
-        if active and scene.uses_floor:
+        if active and (scene.uses_floor or scene.uses_gate):
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
-            piece = np.ascontiguousarray(soften_musical_noise(piece, sr, scene), dtype=np.float32)
+            # Voicing of the network's output, measured once for both stages.
+            mid = np.ascontiguousarray(piece.mean(axis=0), dtype=np.float64)
+            periodicity, f0 = estimate_voicing(mid, sr)
+            voicing = (_debounce_voicing(periodicity), f0)
+            if scene.uses_floor:
+                piece = np.ascontiguousarray(
+                    soften_musical_noise(piece, sr, scene, voicing), dtype=np.float32)
+            if scene.uses_gate:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                piece = np.ascontiguousarray(
+                    apply_noise_floor_gate(piece, sr, scene, voicing), dtype=np.float32)
         expected = tail - pre_start
         if piece.shape[-1] < expected:
             piece = np.pad(piece, ((0, 0), (0, expected - piece.shape[-1])))
@@ -1080,12 +1743,15 @@ class Player:
 
     Both buffers are 48 kHz stereo and the same length, so switching between
     original and denoised keeps the exact playback position. Nothing is read
-    from disk, so the output file is never locked while you listen.
+    from disk, so the output file is never locked while you listen. Each buffer
+    has a playback gain for loudness-matched A/B; the buffers themselves are
+    never rescaled, and a gain of exactly 1.0 is not applied at all.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._buffers: dict[str, np.ndarray | None] = {"original": None, "denoised": None}
+        self._gains = {"original": 1.0, "denoised": 1.0}
         self._source = "original"
         self._pos = 0
         self._playing = False
@@ -1123,6 +1789,7 @@ class Player:
         stereo = self._to_stereo(audio)
         with self._lock:
             self._buffers = {"original": stereo, "denoised": None}
+            self._gains = {"original": 1.0, "denoised": 1.0}
             self._source = "original"
             self._pos = 0
 
@@ -1130,6 +1797,10 @@ class Player:
         stereo = self._to_stereo(audio)
         with self._lock:
             self._buffers["denoised"] = stereo
+
+    def set_gains(self, original: float, denoised: float) -> None:
+        with self._lock:
+            self._gains = {"original": float(original), "denoised": float(denoised)}
 
     def set_source(self, key: str) -> None:
         with self._lock:
@@ -1195,6 +1866,9 @@ class Player:
             end = min(self._pos + frames, len(buf))
             count = end - self._pos
             outdata[:count] = buf[self._pos:end]
+            gain = self._gains[self._source]
+            if gain != 1.0:
+                outdata[:count] *= gain
             if count < frames:
                 outdata[count:] = 0
             self._pos = end
@@ -1280,7 +1954,7 @@ class AudioDeNoiserApp(ctk.CTk):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("860x820")
-        self.minsize(760, 760)
+        self.minsize(760, 804)  # any shorter and the log box loses its last line
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
@@ -1299,6 +1973,10 @@ class AudioDeNoiserApp(ctk.CTk):
         self.audio48: np.ndarray | None = None
         self.orig_env = None
         self.output_path: str | None = None
+        self.source_subtype: str | None = None  # None: no bit depth to keep, save 24-bit
+        self.original_lufs = float("-inf")
+        self.denoised_lufs = float("-inf")
+        self.denoised_peak = 0.0
         self.busy: str | None = None  # None, "load" or "denoise"
         self._last_time_text = ""
         self._pending_file = initial_file
@@ -1367,7 +2045,7 @@ class AudioDeNoiserApp(ctk.CTk):
         # Transport --------------------------------------------------------
         transport = ctk.CTkFrame(self, fg_color="transparent")
         transport.grid(row=3, column=0, sticky="ew", pady=(0, 10), **pad)
-        transport.grid_columnconfigure(4, weight=1)
+        transport.grid_columnconfigure(5, weight=1)
         self.play_btn = self._secondary_button(transport, "Play", self.toggle_play, 90)
         self.play_btn.grid(row=0, column=0, padx=(0, 6))
         self.stop_btn = self._secondary_button(transport, "Stop", self.stop_audio, 80)
@@ -1378,9 +2056,16 @@ class AudioDeNoiserApp(ctk.CTk):
         self.den_btn = self._secondary_button(transport, "B  Denoised",
                                               lambda: self.set_source("denoised"), 120)
         self.den_btn.grid(row=0, column=3)
+        # Playback only: it sets the A and B gains, never the saved file.
+        self.loudness_var = ctk.BooleanVar(value=bool(self.settings.get("loudness_match", True)))
+        self.loudness_switch = ctk.CTkSwitch(transport, text="Match A/B loudness",
+                                             variable=self.loudness_var, font=self._font(13),
+                                             text_color=C_TEXT, progress_color=C_AMBER,
+                                             command=self._on_loudness_toggle)
+        self.loudness_switch.grid(row=0, column=4, sticky="w", padx=(18, 0))
         self.time_label = ctk.CTkLabel(transport, text="0:00 / 0:00", font=self._font(13),
                                        text_color=C_MUTED)
-        self.time_label.grid(row=0, column=4, sticky="e")
+        self.time_label.grid(row=0, column=5, sticky="e")
 
         # Settings ---------------------------------------------------------
         panel = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=10)
@@ -1559,6 +2244,7 @@ class AudioDeNoiserApp(ctk.CTk):
             "highpass": self.highpass_var.get(),
             "post_filter": bool(self.postfilter_var.get()),
             "normalise": bool(self.normalise_var.get()),
+            "loudness_match": bool(self.loudness_var.get()),
             "scene": scene_key,
         }
         if not SCENES[scene_key].active:
@@ -1571,6 +2257,41 @@ class AudioDeNoiserApp(ctk.CTk):
                     data[key] = self.settings[key]
         self.settings.update(data)
         save_settings(self.settings)
+
+    def _on_loudness_toggle(self) -> None:
+        self._save_settings()
+        if self.player.has("denoised"):
+            self._apply_playback_gains(announce=True)
+
+    def _apply_playback_gains(self, announce: bool = False) -> None:
+        """Set the A and B playback gains from the loudness switch. Files are untouched."""
+        matched = None
+        if self.loudness_var.get() and self.player.has("denoised"):
+            matched = loudness_match_gains(
+                self.original_lufs, self.denoised_lufs, self.denoised_peak)
+        if matched is None:
+            self.player.set_gains(1.0, 1.0)
+        else:
+            self.player.set_gains(matched[0], matched[1])
+        if not announce:
+            return
+
+        def lufs(value: float) -> str:
+            return f"{value:.1f} LUFS" if math.isfinite(value) else "too quiet to measure"
+
+        levels = f"original {lufs(self.original_lufs)}, denoised {lufs(self.denoised_lufs)}"
+        if not self.loudness_var.get():
+            self.log(f"A/B plays each version at its own level ({levels}).")
+        elif matched is None:
+            self.log("A/B loudness can't be matched: one version is too short or too "
+                     "quiet to measure, so both play at their own level.")
+        else:
+            original_gain, _denoised_gain, match_db = matched
+            text = f"A/B loudness matched ({levels}): B plays {match_db:+.1f} dB."
+            if original_gain < 1.0:
+                text += (f" Both play {20 * math.log10(original_gain):.1f} dB lower so B "
+                         "stays below full scale.")
+            self.log(text)
 
     def _on_atten_change(self, value) -> None:
         self.atten_index = int(round(float(value)))
@@ -1659,6 +2380,7 @@ class AudioDeNoiserApp(ctk.CTk):
             "post_filter": bool(self.postfilter_var.get()),
             "normalise": bool(self.normalise_var.get()),
             "scene": self._applied_scene,
+            "subtype": self.source_subtype or "PCM_24",
         }
         self.cancel_event.clear()
         self.progress.set(0)
@@ -1751,7 +2473,8 @@ class AudioDeNoiserApp(ctk.CTk):
         audio48 = resample(audio, sr, MODEL_SR)
         self.events.put(("file_loaded", {
             "path": path, "sr": sr, "channels": audio.shape[0], "duration": duration,
-            "frames": audio.shape[1],
+            "frames": audio.shape[1], "subtype": source_subtype(path),
+            "lufs": integrated_loudness(audio48, MODEL_SR),
             "audio48": audio48, "env": waveform_envelope(audio48)}))
 
     def _job_denoise(self, audio48, model, df_state, opts) -> None:
@@ -1764,6 +2487,7 @@ class AudioDeNoiserApp(ctk.CTk):
         previous_beta = getattr(model, "post_filter_beta", None)
         den48 = None
         elapsed = 0.0
+        stats: dict[str, int] = {}
         try:
             model.post_filter = opts["post_filter"]
             if preset.active and previous_beta is not None:
@@ -1780,7 +2504,7 @@ class AudioDeNoiserApp(ctk.CTk):
             den48 = denoise(
                 model, df_state, work, limit, scene=preset if preset.active else None,
                 progress=lambda fraction: put(("progress", fraction)),
-                cancel=self.cancel_event)
+                cancel=self.cancel_event, stats=stats)
             elapsed = time.perf_counter() - started
         finally:
             model.post_filter = previous_filter
@@ -1788,6 +2512,9 @@ class AudioDeNoiserApp(ctk.CTk):
                 model.post_filter_beta = previous_beta
         if den48 is None:
             return
+        # Measured at 48 kHz, as the original was, for the loudness-matched A/B.
+        lufs = integrated_loudness(den48, MODEL_SR)
+        peak = float(np.max(np.abs(den48))) if den48.size else 0.0
 
         out = resample(den48, MODEL_SR, opts["src_sr"])
         # Resampling can be a sample out either way; match the source length exactly.
@@ -1806,12 +2533,17 @@ class AudioDeNoiserApp(ctk.CTk):
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{Path(opts['src_path']).stem}_denoised.wav"
         tmp_path = out_dir / f"{out_path.stem}.partial.wav"
-        sf.write(str(tmp_path), out.T, opts["src_sr"], subtype="PCM_24")
+        subtype = opts.get("subtype", "PCM_24")
+        if subtype not in EXPORT_SUBTYPES:
+            subtype = "PCM_24"
+        write_wav(tmp_path, out, opts["src_sr"], subtype)
         os.replace(tmp_path, out_path)
 
         put(("denoise_done", {"path": str(out_path), "den48": den48,
                               "env": waveform_envelope(den48), "elapsed": elapsed,
-                              "gain_db": gain_db, "clipped": clipped}))
+                              "gain_db": gain_db, "clipped": clipped,
+                              "lufs": lufs, "peak": peak, "subtype": subtype,
+                              "guard": preset.transient_guard, "stats": stats}))
 
     # ------------------------------------------------------- event pump --
     def _poll(self) -> None:
@@ -1845,16 +2577,25 @@ class AudioDeNoiserApp(ctk.CTk):
         self.source_frames = info["frames"]
         self.audio48, self.orig_env = info["audio48"], info["env"]
         self.output_path = None
+        self.source_subtype = info["subtype"]
+        self.original_lufs = info["lufs"]
+        self.denoised_lufs = float("-inf")
+        self.denoised_peak = 0.0
         self.player.load_original(self.audio48)
         self.waveform.set_data(self.orig_env, None)
         self.waveform.set_playhead(0.0)
         channels = {1: "mono", 2: "stereo"}.get(info["channels"], f"{info['channels']} channels")
-        details = f"{info['sr'] / 1000:g} kHz {channels}, {format_time(info['duration'])}"
+        details = f"{info['sr'] / 1000:g} kHz {channels}"
+        if self.source_subtype is not None:
+            details += f", {DEPTH_LABELS[self.source_subtype]}"
+        details += f", {format_time(info['duration'])}"
         self.file_label.configure(text=shorten(Path(info["path"]).name, 70))
         self.file_info.configure(text=details)
         self.progress.set(0)
         self.progress_label.configure(text="")
         self.log(f"Opened {Path(info['path']).name} ({details}).")
+        if math.isfinite(self.original_lufs):
+            self.log(f"Integrated loudness of the original: {self.original_lufs:.1f} LUFS.")
         if info["duration"] > LONG_FILE_MINUTES * 60:
             self.log(f"This recording is over {LONG_FILE_MINUTES} minutes and will use a lot "
                      "of memory. Close other programs if the laptop starts to struggle.")
@@ -1867,6 +2608,8 @@ class AudioDeNoiserApp(ctk.CTk):
     def _on_denoise_done(self, info: dict) -> None:
         self.busy = None
         self.output_path = info["path"]
+        self.denoised_lufs = info["lufs"]
+        self.denoised_peak = info["peak"]
         self.player.set_denoised(info["den48"])
         self.player.set_source("denoised")
         self.waveform.set_data(self.orig_env, info["env"])
@@ -1874,12 +2617,20 @@ class AudioDeNoiserApp(ctk.CTk):
         speed = duration / max(info["elapsed"], 1e-6)
         self.log(f"Denoised {format_time(duration)} of audio in {info['elapsed']:.1f} s "
                  f"({speed:.0f}× real time).")
+        if info["guard"]:
+            clicks, pops = info["stats"].get("clicks", 0), info["stats"].get("pops", 0)
+            if clicks or pops:
+                self.log(f"Transient guard repaired {clicks} click{'s' if clicks != 1 else ''} "
+                         f"and {pops} pop{'s' if pops != 1 else ''}.")
+            else:
+                self.log("Transient guard found no isolated clicks or pops to repair.")
         if info["gain_db"] is not None:
             self.log(f"Normalised to {NORMALISE_PEAK_DBFS:g} dBFS ({info['gain_db']:+.1f} dB).")
         if info["clipped"]:
             self.log("Some peaks went over full scale and were clipped. "
                      "Turn on normalising to avoid this.")
-        self.log(f"Saved {self.output_path}")
+        self.log(f"Saved {self.output_path} ({DEPTH_LABELS[info['subtype']]} WAV).")
+        self._apply_playback_gains(announce=True)
         self.log("Press B to hear the denoised version, A for the original.")
         self._refresh_controls()
 

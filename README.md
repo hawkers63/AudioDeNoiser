@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.1-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.2-F2A93B)
 
 </div>
 
@@ -19,27 +19,30 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 
 - **DeepFilterNet 3** does the heavy lifting: a state-of-the-art neural speech-enhancement model running locally on the CPU, so nothing leaves your machine.
 - **48 kHz processing with polyphase resampling.** Every file is resampled to the model's native 48 kHz with high-quality polyphase filtering, processed in chunks, then resampled back to its original rate.
-- **Instant A/B auditioning.** Original and denoised audio are both held in memory, so you can flip between them during playback with no reload and no gap.
+- **Instant, fair A/B auditioning.** Original and denoised audio are both held in memory, so you can flip between them during playback with no reload and no gap, and they can be played at matched loudness so you hear the noise difference rather than a level difference.
 
 ## Key features
 
 | Feature | Detail |
 | --- | --- |
 | Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
+| Transient guard | Heavy Wind and Highway repair isolated clicks, ticks and knocks (autoregressive interpolation) and low pops in pauses before the model, which otherwise passes them. Consonant bursts are left alone |
+| Floor gate | Heavy Wind, Highway and Pedestrian Street lower the steady wash the model leaves under its blend limit, by up to 10, 12 or 8 dB, with voiced harmonics protected |
 | Wind and traffic rumble attenuation | On Manual, an optional Butterworth high-pass at 60, 80, 100 or 120 Hz. A named scene replaces that switch with its own low-end stage |
 | Adjustable noise reduction | Attenuation limit from 6 dB up to maximum, so you can keep some natural ambience |
-| Instant A/B comparison | Switch between original and denoised audio mid-playback with a single key |
+| Instant A/B comparison | Switch between original and denoised audio mid-playback with a single key. Optionally loudness-matched (ITU-R BS.1770-4) for playback only |
 | Chunked processing | 30 s segments with a 2 s pre-roll and 0.25 s crossfades, giving a real progress bar, a working Cancel button and flat memory use on long recordings |
-| Mastering-ready output | Optional peak normalisation to -1.0 dBFS and 24-bit PCM WAV output |
+| Mastering-ready output | Optional peak normalisation to -1.0 dBFS. WAV output at the source's bit depth (16, 24 or 32-bit PCM, or float); 16-bit is rounded with TPDF dither. MP3 and OGG sources are saved as 24-bit |
 | Broad input support | WAV, MP3, FLAC and OGG |
 | Distinctive interface | CustomTkinter UI styled in streetlight amber on wet asphalt |
 
 ## How the processing chain works
 
 1. Decode WAV, MP3, FLAC or OGG with `soundfile` and resample to 48 kHz.
-2. **Manual** is the 1.0 chain: optionally high-pass filter to remove wind and traffic rumble below 60 to 120 Hz, then hand the audio to the model. A **named scene** does not use that switch. Inside each chunk it runs an infrasonic filter, ducks gust energy under the scene's split while the fragment is unvoiced, and pulls down a steady idle tone or a confirmed 50/100 Hz hum. Heavy Wind and Highway also soften isolated peaks in the hiss band before the crossfade.
-3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades.
-4. Resample back to the source rate, optionally peak-normalise, and save a 24-bit WAV named `<name>_denoised.wav` in the output folder.
+2. **Manual** is the 1.0 chain: optionally high-pass filter to remove wind and traffic rumble below 60 to 120 Hz, then hand the audio to the model. A **named scene** does not use that switch. Inside each chunk, Heavy Wind and Highway first repair isolated clicks and low pops (the transient guard). Every named scene then runs an infrasonic filter, ducks gust energy under the scene's split while the fragment is unvoiced, and pulls down a steady idle tone or a confirmed 50/100 Hz hum.
+3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway and Pedestrian Street lower the steady residual floor (the floor gate), all before the crossfade.
+4. Resample back to the source rate, optionally peak-normalise, and save a WAV named `<name>_denoised.wav` in the output folder, at the source's bit depth (24-bit for MP3 and OGG).
+5. For A/B playback, the integrated loudness of both versions is measured (ITU-R BS.1770-4) and, if **Match A/B loudness** is on, the denoised copy plays at the original's loudness. The saved file is never touched by this.
 
 ## Prerequisites
 
@@ -98,6 +101,7 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
   "highpass": "80 Hz",
   "post_filter": false,
   "normalise": true,
+  "loudness_match": true,
   "last_dir": "",
   "scene": "manual",
   "manual_highpass": "80 Hz",
@@ -113,6 +117,7 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
 | `highpass` | Rumble filter: `Off`, `60 Hz`, `80 Hz`, `100 Hz` or `120 Hz`. Forced to `Off` while a named scene is selected |
 | `post_filter` | DeepFilterNet's extra post-filter for heavy noise |
 | `normalise` | Peak-normalise the saved file to -1.0 dBFS |
+| `loudness_match` | Play A and B at matched integrated loudness. Playback only; missing means on |
 | `last_dir` | Last folder a file was opened from |
 | `scene` | `manual`, `wind`, `traffic`, `street` or `podcast`. Missing or unknown means Manual |
 | `manual_highpass` | Rumble choice remembered while a named scene is in use. Default `80 Hz` |
@@ -138,6 +143,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| [1.2.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.0) | 28 October 2026 | Transient guard (click and pop repair), floor gate, loudness-matched A/B and source bit-depth export with dithered 16-bit. Fixes the 1.1.0 buffer-edge spike. Manual matches 1.1 exactly |
 | [1.1.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0) | 28 October 2026 | Wind and traffic scene presets: Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean. Manual matches 1.0 exactly |
 | [1.0.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.0.0) | 27 October 2026 | First release: DeepFilterNet 3 restoration, rumble filter, chunked processing, A/B auditioning and 24-bit output |
 
