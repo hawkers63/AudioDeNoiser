@@ -9,7 +9,7 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | Version | Theme | Status |
 | --- | --- | --- |
 | 1.0.0 | Baseline desktop app, documentation and licence | Released 27 October 2026 |
-| 1.1.0 | Wind and traffic scene presets | Proposed, design in progress |
+| 1.1.0 | Wind and traffic scene presets | Released 28 October 2026 (tagged locally; push and GitHub Release pending Mark's approval). Mark's listening check pending |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -23,9 +23,11 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 - `AudioDeNoiser.bat` first-run bootstrapper for a private Python 3.11 environment.
 - Repository baseline: `.gitignore`, `settings.example.json`, proprietary `LICENSE`, `README.md`.
 
-## 1.1.0 - Wind and traffic scene presets (proposed)
+## 1.1.0 - Wind and traffic scene presets (released 28 October 2026)
 
 Design note: `notes/01_Active/002_wind_traffic_scene_presets.md` (local only).
+
+Committed and tagged `v1.1.0` locally on 28 October 2026 after automated tests with the real DeepFilterNet 3 model. Pushing the commit and tag, publishing the GitHub Release and Mark's own listening check are still with Mark.
 
 Scope:
 
@@ -37,10 +39,10 @@ Scope:
 
 Done when:
 
-- The patch is applied to `audio_denoiser.py` and the app starts cleanly from `AudioDeNoiser.bat`.
-- A file processed on Manual matches the 1.0 output with the same settings.
-- Each preset passes the listening check described in the design note.
-- `CHANGELOG.md` has a 1.1.0 entry and Mark has approved the push and release.
+- [x] The patch is applied to `audio_denoiser.py` and the app starts cleanly. Verified by constructing the app window from the venv Python with no errors; launching through `AudioDeNoiser.bat` itself was not tested.
+- [x] A file processed on Manual matches the 1.0 output with the same settings. Verified bit-identical (difference 0) against `v1.0.0` with DeepFilterNet 3, at maximum and 18 dB, on the three listening clips and a 70 s multi-chunk file.
+- [ ] Each preset passes the listening check described in the design note. Each preset ran cleanly on its clip with the real model and the measured band levels meet the expectations, but Mark's own listening check is still pending.
+- [ ] `CHANGELOG.md` has a 1.1.0 entry (done) and Mark has approved the push and release (pending).
 
 ## Later
 

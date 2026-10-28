@@ -6,14 +6,22 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
-### Changed
-
-- Design notes in `notes/` are now kept locally only and are no longer tracked in Git.
+## [1.1.0] - 2026-10-28
 
 ### Added
 
+- Scene menu: Manual, Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean.
+- Named scenes precondition each 30 s chunk before DeepFilterNet (infrasonic filter, unvoiced gust duck, idle-tone or confirmed hum reduction). Heavy Wind and Highway also soften isolated hiss-band peaks. No new packages.
+- Settings keys `scene`, `manual_highpass`, `manual_atten_index` and `manual_post_filter`. A missing `scene` stays on Manual, which is the 1.0 chain.
+
 - `ROADMAP.md` setting out the scope of planned work.
 - This changelog.
+
+### Changed
+
+- `denoise()` now converts one chunk at a time to a torch tensor instead of holding a copy of the whole file. Manual output is unchanged: verified bit-identical to 1.0.0 with DeepFilterNet 3 on short clips and a 70 s file.
+- The window is slightly taller (860x820, minimum 760x760) to fit the scene menu.
+- Design notes in `notes/` are now kept locally only and are no longer tracked in Git.
 
 ## [1.0.0] - 2026-10-27
 
@@ -34,5 +42,6 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0
 [1.0.0]: https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.0.0

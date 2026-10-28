@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.0
+Audio DeNoiser 1.1
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -25,7 +25,10 @@ Keys     : Space play/pause, A original, B denoised, Ctrl+O open, Ctrl+D denoise
 How the processing chain works
 ------------------------------
 1. Decode WAV/MP3/FLAC/OGG with soundfile and resample to 48 kHz (the model's rate).
-2. Optional high-pass filter to strip wind and traffic rumble below 60-120 Hz.
+2. Manual runs the 1.0 chain: an optional high-pass below 60-120 Hz, then the
+   model. A named scene instead conditions each chunk before the model, with an
+   infrasonic filter, a gust duck and an idle-tone stage. Heavy Wind and Highway
+   also soften isolated spectral peaks before the chunk crossfade.
 3. DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the
    model has settled before its output is used, joined with 0.25 s crossfades.
    Chunking gives a real progress bar, a working Cancel button and flat memory use.
@@ -44,6 +47,7 @@ import threading
 import time
 import traceback
 import warnings
+from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
 
@@ -58,7 +62,8 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, resample_poly, sosfiltfilt
+from scipy.ndimage import median_filter, uniform_filter1d
+from scipy.signal import butter, istft, resample_poly, sosfilt, sosfilt_zi, sosfiltfilt, stft
 import tkinter as tk
 from tkinter import filedialog
 import customtkinter as ctk
@@ -75,7 +80,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -144,6 +149,759 @@ def highpass(audio: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
     return np.ascontiguousarray(sosfiltfilt(sos, audio, axis=-1), dtype=np.float32)
 
 
+# Scene conditioner. Manual never calls this. Named scenes run it on each
+# extended chunk, before DeepFilterNet, and the spectral floor runs afterwards.
+GUST_HOP = 480
+VOICE_FRAME = 2048
+VOICE_HOP = 480
+F0_MIN_HZ = 70.0
+F0_MAX_HZ = 320.0
+FLOOR_FRAME = 2048
+FLOOR_HOP = 1024  # 50% Hann overlap, which satisfies NOLA
+NOTCH_FRAME = 8192
+NOTCH_HOP = 4096  # 5.86 Hz bins, 50% overlap
+VOICE_HIGHBAND_HZ = 280.0
+# Frames whose energy above VOICE_HIGHBAND_HZ is more than this far below the
+# frame energy are rumble or silence. Their autocorrelation is meaningless.
+VOICE_HIGHBAND_MARGIN_DB = 30.0
+VOICING_MIN = 0.33
+
+_SOS_CACHE: dict[tuple, np.ndarray] = {}
+
+
+@dataclass(frozen=True)
+class ScenePreset:
+    """One outdoor-scene profile.
+
+    ``atten_db`` is the DeepFilterNet blend limit. ``None`` on a stage switches
+    that stage off. Manual leaves the existing rumble filter and slider in charge.
+    """
+
+    key: str
+    label: str
+    summary: str
+    atten_db: int | None
+    post_filter: bool
+    post_filter_beta: float
+    infrasonic_hz: float | None
+    gust_split_hz: float | None
+    gust_max_db: float
+    gust_margin_db: float
+    gust_voiced_cap_db: float
+    gust_attack_s: float
+    gust_release_s: float
+    notch_lo_hz: float | None
+    notch_hi_hz: float | None
+    notch_max_db: float
+    notch_max_count: int
+    hum_hz: tuple[float, ...]
+    floor_lo_hz: float | None
+    floor_hi_hz: float | None
+    floor_peak_db: float
+    floor_max_db: float
+
+    @property
+    def active(self) -> bool:
+        return self.key != "manual"
+
+    @property
+    def uses_floor(self) -> bool:
+        return self.floor_lo_hz is not None and self.floor_hi_hz is not None
+
+
+class ConditionerState:
+    """Reusable scratch and the slow low-band floor carried across chunks."""
+
+    def __init__(self) -> None:
+        self.low_floor_db: float | None = None
+        self._scratch: dict[str, np.ndarray] = {}
+
+    def buffer(self, name: str, shape: tuple[int, ...]) -> np.ndarray:
+        """Return a float64 scratch buffer, allocating only when the shape changes."""
+        current = self._scratch.get(name)
+        if current is None or current.shape != shape:
+            current = np.empty(shape, dtype=np.float64)
+            self._scratch[name] = current
+        return current
+
+
+def _sos(kind: str, sr: int, hz: float, order: int = 4) -> np.ndarray:
+    """Design a Butterworth SOS, cached for the rest of the process."""
+    if sr <= 0:
+        raise ValueError("Sample rate must be positive.")
+    nyquist = sr / 2
+    if not 1.0 < hz < nyquist - 1.0:
+        raise ValueError(f"Cutoff {hz:g} Hz is outside the usable band at {sr} Hz.")
+    key = (kind, sr, round(float(hz), 3), order)
+    cached = _SOS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if kind == "high":
+        sos = butter(order, hz, btype="highpass", fs=sr, output="sos")
+    elif kind == "low":
+        sos = butter(order, hz, btype="lowpass", fs=sr, output="sos")
+    else:
+        raise ValueError(f"Unknown filter kind {kind!r}.")
+    sos = np.asarray(sos, dtype=np.float64)
+    _SOS_CACHE[key] = sos
+    return sos
+
+
+def _linkwitz_riley(sr: int, hz: float) -> tuple[np.ndarray, np.ndarray]:
+    """Fourth-order Linkwitz-Riley pair: two cascaded Butterworth sections of order 2.
+
+    The low and high outputs sum to a flat, time-aligned all-pass, so ducking
+    only the low output does not comb against the high output.
+    """
+    low = _sos("low", sr, hz, order=2)
+    high = _sos("high", sr, hz, order=2)
+    return np.vstack((low, low)), np.vstack((high, high))
+
+
+def _apply_sos(audio: np.ndarray, sos: np.ndarray, state: ConditionerState, name: str) -> np.ndarray:
+    """Causal SOS filter with the initial state set from the first sample.
+
+    Seeding the state from the first sample keeps a gust from producing a click
+    while the filter wakes up. The 2 s chunk pre-roll then finishes the settling.
+    """
+    out = state.buffer(name, audio.shape)
+    zi_unit = sosfilt_zi(sos)
+    for channel in range(audio.shape[0]):
+        initial = zi_unit * float(audio[channel, 0])
+        filtered, _ = sosfilt(sos, audio[channel], zi=initial)
+        out[channel] = filtered
+    return out
+
+
+def _safe_filtfilt(audio: np.ndarray, sos: np.ndarray) -> np.ndarray:
+    """Zero-phase SOS filter. Short fragments keep the input rather than raising."""
+    try:
+        return sosfiltfilt(sos, audio, axis=-1)
+    except ValueError:
+        return audio
+
+
+def _frames(mono: np.ndarray, frame: int, hop: int) -> np.ndarray:
+    """Read-only framed view. The caller must copy before writing."""
+    if mono.shape[0] < frame:
+        return np.zeros((0, frame), dtype=np.float64)
+    count = 1 + (mono.shape[0] - frame) // hop
+    stride = mono.strides[0]
+    view = np.lib.stride_tricks.as_strided(
+        mono, shape=(count, frame), strides=(hop * stride, stride), writeable=False
+    )
+    return view
+
+
+def estimate_voicing(mono: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Periodicity and f0, one value per ``VOICE_HOP`` samples.
+
+    The spectrum is flattened with a short cepstral envelope so tyre hiss does
+    not swamp a vowel, then bins below 280 Hz are removed before the
+    autocorrelation. Wind and road rumble therefore cannot impersonate a voice.
+    A frame whose remaining high-band energy is negligible is marked unvoiced:
+    the normalised autocorrelation of near-silence is otherwise a coin toss.
+    """
+    empty = np.zeros(0, dtype=np.float64)
+    if mono.shape[0] < VOICE_FRAME:
+        return empty, empty
+    frames = _frames(np.ascontiguousarray(mono, dtype=np.float64), VOICE_FRAME, VOICE_HOP)
+    if len(frames) == 0:
+        return empty, empty
+    spectrum = np.fft.rfft(frames * np.hanning(VOICE_FRAME), axis=-1)
+    magnitude = np.abs(spectrum) + 1e-8
+    cepstrum = np.fft.irfft(np.log(magnitude), n=VOICE_FRAME, axis=-1)
+    keep = max(8, int(0.0015 * sr))
+    cepstrum[:, keep:] = 0
+    envelope = np.exp(np.fft.rfft(cepstrum, n=VOICE_FRAME, axis=-1).real) + 1e-8
+    cutoff = int(VOICE_HIGHBAND_HZ / (sr / VOICE_FRAME))
+    total = np.mean(magnitude[:, 1:] ** 2, axis=1)
+    high = np.mean(magnitude[:, cutoff:] ** 2, axis=1)
+    audible = high > total * 10 ** (-VOICE_HIGHBAND_MARGIN_DB / 10)
+    flat = spectrum / envelope
+    flat[:, :cutoff] = 0
+    excitation = np.fft.irfft(flat, n=VOICE_FRAME, axis=-1)
+    exc_spectrum = np.fft.rfft(excitation, axis=-1)
+    autocorr = np.fft.irfft(exc_spectrum.real ** 2 + exc_spectrum.imag ** 2, n=VOICE_FRAME, axis=-1)
+    autocorr /= np.maximum(autocorr[:, :1], 1e-12)
+    lag_min = max(1, int(sr / F0_MAX_HZ))
+    lag_max = min(VOICE_FRAME - 1, int(sr / F0_MIN_HZ))
+    search = autocorr[:, lag_min:lag_max]
+    peak = np.where(audible, search.max(axis=1), 0.0)
+    lag = search.argmax(axis=1) + lag_min
+    f0 = np.where(audible, sr / np.maximum(lag, 1), 0.0)
+    return peak.astype(np.float64), f0.astype(np.float64)
+
+
+def _hop_rms_db(mono: np.ndarray, hop: int) -> np.ndarray:
+    count = mono.shape[0] // hop
+    if count <= 0:
+        rms = math.sqrt(float(np.mean(mono * mono)) + 1e-12) if mono.size else 1e-6
+        return np.array([20 * math.log10(rms)], dtype=np.float64)
+    trimmed = mono[: count * hop].reshape(count, hop)
+    power = np.mean(trimmed * trimmed, axis=1)
+    return 20 * np.log10(np.sqrt(power + 1e-12))
+
+
+def _smooth_gain(target: np.ndarray, attack_s: float, release_s: float, hop_s: float) -> np.ndarray:
+    """One-pole attack/release. Falling gain (a gust arriving) uses the attack time."""
+    if target.size == 0:
+        return target
+    attack = math.exp(-hop_s / max(attack_s, 1e-4))
+    release = math.exp(-hop_s / max(release_s, 1e-4))
+    out = np.empty_like(target)
+    current = float(target[0])
+    for index, sample in enumerate(target):
+        value = float(sample)
+        coeff = attack if value < current else release
+        current = current + (1.0 - coeff) * (value - current)
+        out[index] = current
+    return out
+
+
+def _expand_hops(gain: np.ndarray, hop: int, length: int) -> np.ndarray:
+    """Hold each hop gain across its samples. The final hop covers the tail."""
+    expanded = np.repeat(gain, hop)
+    if expanded.size < length:
+        expanded = np.pad(expanded, (0, length - expanded.size), mode="edge")
+    return expanded[:length]
+
+
+def _track_floor(state: ConditionerState, low_db: np.ndarray) -> float:
+    """Slow floor: drop immediately when a quieter chunk arrives, rise very slowly.
+
+    A chunk that is entirely wind would otherwise treat the gust as the floor and
+    refuse to duck it. Carrying the quietest floor forward fixes later chunks.
+    The first chunk still depends on having a quiet moment of its own.
+    """
+    local = float(np.percentile(low_db, 20)) if low_db.size else -80.0
+    if not math.isfinite(local):
+        local = -80.0
+    held = state.low_floor_db
+    if held is None or local < held:
+        state.low_floor_db = local
+    else:
+        state.low_floor_db = held + 0.05 * (local - held)
+    return float(state.low_floor_db)
+
+
+def _debounce_voicing(periodicity: np.ndarray) -> np.ndarray:
+    """Drop one-frame spikes. A vowel lasts far longer than five 10 ms hops."""
+    if periodicity.size < 5:
+        return periodicity
+    return median_filter(periodicity, size=5)
+
+
+def apply_gust_duck(
+    audio: np.ndarray,
+    sr: int,
+    preset: ScenePreset,
+    state: ConditionerState,
+    periodicity: np.ndarray | None = None,
+) -> np.ndarray:
+    """Duck gust energy below ``gust_split_hz`` while a voice is sounding.
+
+    The split is Linkwitz-Riley, so the unducked high band stays sample-aligned
+    with the low band. Voiced hops are capped at ``gust_voiced_cap_db`` and
+    therefore keep their fundamental. Pass the periodicity measured on the dry
+    chunk: the infrasonic filter rings, and that ring can look like a vowel.
+    """
+    if preset.gust_split_hz is None or audio.shape[-1] < sr // 5:
+        return audio
+    low_sos, high_sos = _linkwitz_riley(sr, preset.gust_split_hz)
+    low = _apply_sos(audio, low_sos, state, "gust-low")
+    high = _apply_sos(audio, high_sos, state, "gust-high")
+    mono_low = low.mean(axis=0)
+    low_db = _hop_rms_db(mono_low, GUST_HOP)
+    floor_db = _track_floor(state, low_db)
+    excess = low_db - floor_db - preset.gust_margin_db
+    raw_db = np.clip(excess, 0.0, preset.gust_max_db)
+
+    if periodicity is None:
+        voicing, _f0 = estimate_voicing(np.ascontiguousarray(audio.mean(axis=0)), sr)
+        voicing = _debounce_voicing(voicing)
+    else:
+        voicing = periodicity
+    hops = min(raw_db.shape[0], voicing.shape[0])
+    if hops == 0:
+        return low + high
+    voiced = voicing[:hops] >= VOICING_MIN
+    raw_db = raw_db[:hops]
+    raw_db = np.where(voiced, np.minimum(raw_db, preset.gust_voiced_cap_db), raw_db)
+    target = np.power(10.0, -raw_db / 20.0)
+    smoothed = _smooth_gain(target, preset.gust_attack_s, preset.gust_release_s, GUST_HOP / sr)
+    gain = _expand_hops(smoothed, GUST_HOP, audio.shape[-1])
+    ducked = low * gain
+    return ducked + high
+
+
+def _tone_spectrum(mono: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Long-window STFT used to tell an idle tone from a vowel."""
+    _freqs, _times, spectrum = stft(
+        mono,
+        fs=sr,
+        window="hann",
+        nperseg=NOTCH_FRAME,
+        noverlap=NOTCH_FRAME - NOTCH_HOP,
+        boundary=None,
+        padded=False,
+    )
+    return np.abs(spectrum), spectrum
+
+
+def _prominence(median: np.ndarray) -> np.ndarray:
+    """How far each bin stands above the median of the bins just beside it.
+
+    The four bins on either side, skipping the two closest, are the local
+    floor. A broad rumble shelf is as loud as that floor, so its prominence is
+    about 0 dB and it is left alone. A narrow idle tone stands proud of it.
+    """
+    padded = np.pad(median, 8, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, 4)
+    # Centre of bin i sits at padded[i + 8]. These windows cover offsets -6..-3
+    # and +3..+6, leaving the peak's own shoulders out of the floor estimate.
+    left = windows[2 : 2 + median.size]
+    right = windows[11 : 11 + median.size]
+    neighbour = np.median(np.concatenate((left, right), axis=1), axis=1)
+    return 20 * np.log10((median + 1e-12) / (neighbour + 1e-12))
+
+
+def _refine_peak(median: np.ndarray, index: int, bin_hz: float) -> float:
+    """Parabolic interpolation, so a tone between FFT bins is not missed."""
+    if index <= 0 or index >= median.size - 1:
+        return index * bin_hz
+    alpha, beta, gamma = median[index - 1], median[index], median[index + 1]
+    denom = alpha - 2 * beta + gamma
+    if abs(denom) < 1e-12:
+        return index * bin_hz
+    delta = float(np.clip(0.5 * (alpha - gamma) / denom, -0.5, 0.5))
+    return (index + delta) * bin_hz
+
+
+def find_stable_tones(
+    magnitude: np.ndarray,
+    sr: int,
+    lo_hz: float | None,
+    hi_hz: float | None,
+    max_count: int,
+    forced_hz: tuple[float, ...] = (),
+    prominence_db: float = 7.0,
+    stability_min: float = 0.72,
+) -> list[float]:
+    """Frequencies that stay put for the whole fragment.
+
+    A vowel comes and goes, so its median sits far below its loud frames and it
+    is rejected. An engine idle or a mains hum is present in almost every frame,
+    so the median nearly equals the 90th percentile and the tone is kept.
+    """
+    if max_count <= 0 or magnitude.shape[1] < 4:
+        return []
+    median = np.median(magnitude, axis=1)
+    upper = np.percentile(magnitude, 90, axis=1)
+    stability = median / (upper + 1e-12)
+    prominence = _prominence(median)
+    bin_hz = sr / NOTCH_FRAME
+    chosen: list[tuple[float, float]] = []
+
+    def consider(frequency: float) -> None:
+        if not 20.0 < frequency < sr / 2 - 50.0:
+            return
+        index = int(round(frequency / bin_hz))
+        index = max(1, min(magnitude.shape[0] - 2, index))
+        if stability[index] < stability_min or prominence[index] < prominence_db:
+            return
+        if any(abs(frequency - previous) < 18.0 for previous, _score in chosen):
+            return
+        chosen.append((frequency, float(prominence[index])))
+
+    if lo_hz is not None and hi_hz is not None and hi_hz > lo_hz:
+        first = max(1, int(math.ceil(lo_hz / bin_hz)))
+        last = min(magnitude.shape[0] - 2, int(math.floor(hi_hz / bin_hz)))
+        order = np.argsort(prominence[first : last + 1])[::-1]
+        for offset in order:
+            if len(chosen) >= max_count:
+                break
+            index = first + int(offset)
+            if stability[index] < stability_min or prominence[index] < prominence_db:
+                continue
+            if prominence[index] < prominence[index - 1] or prominence[index] < prominence[index + 1]:
+                continue
+            frequency = _refine_peak(median, index, bin_hz)
+            if any(abs(frequency - previous) < 18.0 for previous, _score in chosen):
+                continue
+            chosen.append((frequency, float(prominence[index])))
+    for frequency in forced_hz:
+        if len(chosen) >= max_count:
+            break
+        consider(frequency)
+    chosen.sort(key=lambda item: item[1], reverse=True)
+    return [frequency for frequency, _score in chosen[:max_count]]
+
+
+def _istft(spectrum: np.ndarray, sr: int, frame: int, hop: int) -> np.ndarray:
+    """Inverse STFT matching ``_tone_spectrum`` / the spectral floor.
+
+    Scipy warns that the Hann window fails NOLA because its first sample is
+    exactly zero. The overlap itself is the standard 50 percent. The difference
+    method in the callers never replaces samples whose gain is unity, so that
+    endpoint does not touch the speech we meant to leave alone.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="NOLA condition failed")
+        _times, restored = istft(
+            spectrum,
+            fs=sr,
+            window="hann",
+            nperseg=frame,
+            noverlap=frame - hop,
+            boundary=False,
+            input_onesided=True,
+        )
+    return np.asarray(restored, dtype=np.float64)
+
+
+def _apply_spectral_gain(
+    audio: np.ndarray, sr: int, delta_gain: np.ndarray, frame: int, hop: int
+) -> np.ndarray:
+    """Add the inverse STFT of ``spectrum * delta_gain`` to the dry signal.
+
+    Bins whose delta is zero are not rewritten, so a stage that leaves a bin
+    alone cannot smear it through the inverse transform.
+    """
+    length = audio.shape[-1]
+    cleaned = np.empty(audio.shape, dtype=np.float64)
+    for channel in range(audio.shape[0]):
+        _frequencies, _times, spectrum = stft(
+            np.ascontiguousarray(audio[channel], dtype=np.float64),
+            fs=sr,
+            window="hann",
+            nperseg=frame,
+            noverlap=frame - hop,
+            boundary=None,
+            padded=False,
+        )
+        times = min(spectrum.shape[1], delta_gain.shape[1])
+        bins = min(spectrum.shape[0], delta_gain.shape[0])
+        shaped = np.zeros_like(spectrum)
+        shaped[:bins, :times] = spectrum[:bins, :times] * delta_gain[:bins, :times]
+        restored = _istft(shaped, sr, frame, hop)
+        if restored.shape[0] < length:
+            restored = np.pad(restored, (0, length - restored.shape[0]))
+        cleaned[channel] = audio[channel] + restored[:length]
+    if not np.isfinite(cleaned).all():
+        raise ValueError("Spectral gain produced invalid samples.")
+    return cleaned
+
+
+def suppress_stable_tones(
+    audio: np.ndarray, sr: int, preset: ScenePreset, periodicity: np.ndarray | None = None
+) -> np.ndarray:
+    """Attenuate idle tones and confirmed hum without notching a vowel.
+
+    Tones at or above 70 Hz, which is where a speaking fundamental can sit, are
+    turned down only on frames the voicing detector has rejected. A steady
+    fundamental is therefore left intact while it is being spoken, and an engine
+    idle is still removed in the pauses and under unvoiced noise. Mains hum
+    below 70 Hz is turned down on every frame, because it is under the voice.
+    """
+    hunting = preset.notch_lo_hz is not None and preset.notch_hi_hz is not None
+    if not hunting and not preset.hum_hz:
+        return audio
+    if audio.shape[-1] < NOTCH_FRAME or preset.notch_max_db <= 0 or preset.notch_max_count <= 0:
+        return audio
+    mono = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    magnitude, _spectrum = _tone_spectrum(mono, sr)
+    tones = find_stable_tones(
+        magnitude,
+        sr,
+        preset.notch_lo_hz if hunting else None,
+        preset.notch_hi_hz if hunting else None,
+        preset.notch_max_count,
+        forced_hz=preset.hum_hz,
+    )
+    if not tones:
+        return audio
+    if periodicity is None:
+        periodicity, _f0 = estimate_voicing(mono, sr)
+        periodicity = _debounce_voicing(periodicity)
+    n_bins, n_times = magnitude.shape
+    if periodicity.size:
+        source = np.arange(periodicity.size) * VOICE_HOP + VOICE_FRAME / 2
+        target = np.arange(n_times) * NOTCH_HOP + NOTCH_FRAME / 2
+        period_on = np.interp(target, source, periodicity, left=0.0, right=0.0)
+    else:
+        period_on = np.zeros(n_times)
+    unvoiced = period_on < VOICING_MIN
+    gain = np.ones((n_bins, n_times), dtype=np.float64)
+    depth = 10 ** (-preset.notch_max_db / 20.0)
+    bin_hz = sr / NOTCH_FRAME
+    for frequency in tones:
+        centre = frequency / bin_hz
+        always = frequency < 70.0
+        for offset in range(-3, 4):
+            index = int(round(centre)) + offset
+            if not 0 <= index < n_bins:
+                continue
+            # Full depth on the bin the tone actually occupies and its two
+            # neighbours (the Hann main lobe). Further bins taper out so the
+            # cut does not become a wide scoop in the vowel range.
+            distance = abs(index - centre)
+            if distance <= 1.25:
+                weight = 1.0
+            else:
+                weight = max(0.0, 1.0 - (distance - 1.25) / 1.75)
+            target_gain = 1.0 - weight * (1.0 - depth)
+            if always:
+                gain[index] = np.minimum(gain[index], target_gain)
+            else:
+                gain[index, unvoiced] = np.minimum(gain[index, unvoiced], target_gain)
+    if np.all(gain > 0.999):
+        return audio
+    return _apply_spectral_gain(audio, sr, gain - 1.0, NOTCH_FRAME, NOTCH_HOP)
+
+
+def _protect_harmonics(
+    f0_hz: np.ndarray, periodicity: np.ndarray, n_bins: int, n_times: int, sr: int
+) -> np.ndarray:
+    """Mark bins that sit on a voiced harmonic, plus one bin either side."""
+    protect = np.zeros((n_bins, n_times), dtype=bool)
+    times = min(n_times, f0_hz.shape[0], periodicity.shape[0])
+    if times == 0:
+        return protect
+    bin_hz = sr / FLOOR_FRAME
+    valid = periodicity[:times] >= VOICING_MIN
+    if not np.any(valid):
+        return protect
+    time_index = np.arange(times)
+    usable = np.flatnonzero(valid)
+    for harmonic in range(1, 17):
+        centres = np.rint(harmonic * f0_hz[:times] / bin_hz).astype(np.int32)
+        for offset in (-1, 0, 1):
+            index = np.clip(centres[usable] + offset, 0, n_bins - 1)
+            protect[index, time_index[usable]] = True
+    return protect
+
+
+def soften_musical_noise(audio: np.ndarray, sr: int, preset: ScenePreset) -> np.ndarray:
+    """Pull isolated spectral peaks in the tyre band down towards the local median.
+
+    Unity gains return the input unchanged, so speech that the detector leaves
+    alone is not passed through an inverse STFT at all. Harmonics of a detected
+    f0 are marked and left alone, which keeps vowels from being chiselled out.
+    """
+    if not preset.uses_floor:
+        return audio
+    _channels, length = audio.shape
+    if length < FLOOR_FRAME * 2:
+        return audio
+    mid = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    _freqs, _times, mid_spectrum = stft(
+        mid,
+        fs=sr,
+        window="hann",
+        nperseg=FLOOR_FRAME,
+        noverlap=FLOOR_FRAME - FLOOR_HOP,
+        boundary=None,
+        padded=False,
+    )
+    magnitude = np.abs(mid_spectrum)
+    smoothed = median_filter(magnitude, size=(5, 7))
+    excess_db = 20 * np.log10((magnitude + 1e-8) / (smoothed + 1e-8))
+    pull_db = np.clip(excess_db - preset.floor_peak_db, 0.0, preset.floor_max_db)
+    bin_hz = sr / FLOOR_FRAME
+    band = (np.arange(magnitude.shape[0]) >= preset.floor_lo_hz / bin_hz) & (
+        np.arange(magnitude.shape[0]) <= preset.floor_hi_hz / bin_hz
+    )
+    pull_db *= band[:, None]
+    periodicity, f0 = estimate_voicing(mid, sr)
+    periodicity = _debounce_voicing(periodicity)
+    # estimate_voicing hops by VOICE_HOP; the floor STFT hops by FLOOR_HOP.
+    # Resample the f0 track onto the STFT grid with a nearest hold.
+    if f0.size:
+        source = np.arange(f0.size) * VOICE_HOP + VOICE_FRAME / 2
+        target = np.arange(magnitude.shape[1]) * FLOOR_HOP + FLOOR_FRAME / 2
+        f0_on_grid = np.interp(target, source, f0, left=f0[0], right=f0[-1])
+        period_on_grid = np.interp(target, source, periodicity, left=periodicity[0], right=periodicity[-1])
+    else:
+        f0_on_grid = np.zeros(magnitude.shape[1])
+        period_on_grid = np.zeros(magnitude.shape[1])
+    protect = _protect_harmonics(
+        f0_on_grid, period_on_grid, magnitude.shape[0], magnitude.shape[1], sr
+    )
+    pull_db = np.where(protect, 0.0, pull_db)
+    gain = np.power(10.0, -pull_db / 20.0)
+    gain = uniform_filter1d(gain, size=3, axis=0, mode="nearest")
+    gain = uniform_filter1d(gain, size=3, axis=1, mode="nearest")
+    gain = np.clip(gain, 10 ** (-preset.floor_max_db / 20.0), 1.0)
+    # Ignore sub-audible nibbles so an untouched vowel is returned byte-for-byte.
+    gain = np.where(gain > 0.99, 1.0, gain)
+    if np.all(gain > 0.999):
+        return audio
+
+    return _apply_spectral_gain(audio, sr, gain - 1.0, FLOOR_FRAME, FLOOR_HOP)
+
+
+def apply_scene(
+    audio: np.ndarray, sr: int, preset: ScenePreset, state: ConditionerState | None = None
+) -> np.ndarray:
+    """Run the pre-model wind and traffic conditioner on one chunk.
+
+    The chunk must include the processing pre-roll. Edge effects of the
+    zero-phase filters then fall in audio that the chunk loop discards or
+    crossfades, rather than in the speech the listener keeps.
+    """
+    if not preset.active:
+        return audio
+    if audio.ndim != 2:
+        raise ValueError("Scene conditioning expected audio shaped (channels, frames).")
+    if sr != MODEL_SR:
+        raise ValueError(
+            f"Scene processing is tuned for {MODEL_SR} Hz, but the audio is {sr} Hz."
+        )
+    if audio.shape[-1] < sr // 5:
+        return np.ascontiguousarray(audio, dtype=np.float32)
+    if not np.isfinite(audio).all():
+        raise ValueError("The audio contains invalid samples and cannot be conditioned.")
+    if state is None:
+        state = ConditionerState()
+
+    # Voicing is measured on the dry chunk. The steep infrasonic filter rings,
+    # and that ring can look like a vowel if it is measured afterwards.
+    dry = np.ascontiguousarray(audio.mean(axis=0), dtype=np.float64)
+    periodicity, _f0 = estimate_voicing(dry, sr)
+    periodicity = _debounce_voicing(periodicity)
+
+    work = np.array(audio, dtype=np.float64, copy=True)
+    if preset.infrasonic_hz is not None:
+        work = _safe_filtfilt(work, _sos("high", sr, preset.infrasonic_hz, order=4))
+    if preset.gust_split_hz is not None:
+        work = apply_gust_duck(work, sr, preset, state, periodicity)
+
+    work = suppress_stable_tones(work, sr, preset, periodicity)
+    if not np.isfinite(work).all():
+        raise ValueError("Scene conditioning produced invalid samples.")
+    return np.ascontiguousarray(work, dtype=np.float32)
+
+
+def _preset(**overrides) -> ScenePreset:
+    base = dict(
+        key="custom",
+        label="Custom",
+        summary="",
+        atten_db=None,
+        post_filter=False,
+        post_filter_beta=0.02,
+        infrasonic_hz=None,
+        gust_split_hz=None,
+        gust_max_db=12.0,
+        gust_margin_db=8.0,
+        gust_voiced_cap_db=3.0,
+        gust_attack_s=0.025,
+        gust_release_s=0.40,
+        notch_lo_hz=None,
+        notch_hi_hz=None,
+        notch_max_db=10.0,
+        notch_max_count=3,
+        hum_hz=(),
+        floor_lo_hz=None,
+        floor_hi_hz=None,
+        floor_peak_db=8.0,
+        floor_max_db=6.0,
+    )
+    base.update(overrides)
+    return ScenePreset(**base)
+
+
+WIND = _preset(
+    key="wind",
+    label="Heavy Wind & Gusts",
+    summary=(
+        "Strips infrasonic buffeting, then ducks gusts under 220 Hz only while the voice is unvoiced."
+    ),
+    atten_db=30,
+    post_filter=True,
+    post_filter_beta=0.02,
+    infrasonic_hz=38.0,
+    gust_split_hz=220.0,
+    gust_max_db=12.0,
+    gust_margin_db=8.0,
+    gust_voiced_cap_db=3.0,
+    gust_attack_s=0.030,
+    gust_release_s=0.45,
+    floor_lo_hz=2000.0,
+    floor_hi_hz=5000.0,
+    floor_peak_db=10.0,
+    floor_max_db=4.0,
+)
+TRAFFIC = _preset(
+    key="traffic",
+    label="Highway / Traffic Drone",
+    summary="Tames road rumble and steady engine tones, and softens the tyre-hiss floor.",
+    atten_db=24,
+    post_filter=True,
+    post_filter_beta=0.05,
+    infrasonic_hz=32.0,
+    gust_split_hz=130.0,
+    gust_max_db=8.0,
+    gust_margin_db=6.0,
+    gust_voiced_cap_db=2.5,
+    gust_attack_s=0.040,
+    gust_release_s=0.80,
+    notch_lo_hz=75.0,
+    notch_hi_hz=210.0,
+    notch_max_db=10.0,
+    notch_max_count=3,
+    floor_lo_hz=1200.0,
+    floor_hi_hz=4000.0,
+    floor_peak_db=8.0,
+    floor_max_db=6.0,
+)
+STREET = _preset(
+    key="street",
+    label="Pedestrian Street",
+    summary="Light low-end control for street talk, without chewing consonants or nearby voices.",
+    atten_db=18,
+    post_filter=True,
+    post_filter_beta=0.02,
+    infrasonic_hz=30.0,
+    gust_split_hz=160.0,
+    gust_max_db=6.0,
+    gust_margin_db=8.0,
+    gust_voiced_cap_db=2.5,
+    gust_attack_s=0.035,
+    gust_release_s=0.50,
+    notch_lo_hz=80.0,
+    notch_hi_hz=200.0,
+    notch_max_db=8.0,
+    notch_max_count=2,
+)
+PODCAST = _preset(
+    key="podcast",
+    label="Subtle Podcast Clean",
+    summary="Keeps the voice natural. A confirmed 50 Hz hum notch only, and modest noise reduction.",
+    atten_db=12,
+    post_filter=False,
+    post_filter_beta=0.02,
+    hum_hz=(50.0, 100.0),
+    notch_max_db=8.0,
+    notch_max_count=2,
+)
+MANUAL = _preset(
+    key="manual",
+    label="Manual",
+    summary="Uses the controls below, with no extra wind or traffic processing.",
+    atten_db=None,
+    post_filter=False,
+    post_filter_beta=0.02,
+)
+
+SCENES: dict[str, ScenePreset] = {
+    preset.key: preset for preset in (MANUAL, WIND, TRAFFIC, STREET, PODCAST)
+}
+SCENE_ORDER = ("manual", "wind", "traffic", "street", "podcast")
+SCENE_BY_LABEL = {preset.label: preset for preset in SCENES.values()}
+
+
 def peak_normalise(audio: np.ndarray, peak_dbfs: float) -> tuple[np.ndarray, float]:
     """Scale so the loudest sample sits at peak_dbfs. Returns (audio, gain_db)."""
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
@@ -167,47 +925,70 @@ def load_model():
 
 
 def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
+            scene: ScenePreset | None = None,
             progress=None, cancel: threading.Event | None = None) -> np.ndarray:
-    """Run DeepFilterNet over 48 kHz audio (channels, frames) in overlapping chunks."""
+    """Run DeepFilterNet over 48 kHz audio (channels, frames) in overlapping chunks.
+
+    A named scene conditions each extended chunk before the network sees it.
+    Manual passes the audio through unchanged, so today's slider and rumble
+    settings keep today's results. The torch tensor is one chunk, not the file.
+    """
     import torch
     from df.enhance import enhance
 
-    sr = df_state.sr()
-    channels, n = audio.shape
-    n_chunks = max(1, math.ceil(n / (CHUNK_SECONDS * sr)))
-    chunk = math.ceil(n / n_chunks)  # balanced chunk sizes, no tiny last chunk
+    sr = int(df_state.sr())
+    channels, frames = audio.shape
+    active = scene is not None and scene.active
+    if active and sr != MODEL_SR:
+        raise ValueError(
+            f"Scene processing is tuned for {MODEL_SR} Hz, but the model reported {sr} Hz.")
+
+    n_chunks = max(1, math.ceil(frames / (CHUNK_SECONDS * sr)))
+    chunk = math.ceil(frames / n_chunks)  # balanced chunk sizes, no tiny last chunk
     pre = int(PREROLL_SECONDS * sr)
     xfade = int(CROSSFADE_SECONDS * sr)
+    out = np.zeros((channels, frames), dtype=np.float32)
+    state = ConditionerState()
 
-    src = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
-    out = np.zeros((channels, n), dtype=np.float32)
-
-    for k in range(n_chunks):
+    for index in range(n_chunks):
         if cancel is not None and cancel.is_set():
             raise Cancelled()
-        start = k * chunk
-        end = min(n, start + chunk)
-        last = k == n_chunks - 1
-        a = max(0, start - pre)                 # pre-roll: model settles here
-        b = n if last else min(n, end + xfade)  # tail: crossfades into next chunk
+        start = index * chunk
+        end = min(frames, start + chunk)
+        last = index == n_chunks - 1
+        pre_start = max(0, start - pre)
+        tail = frames if last else min(frames, end + xfade)
 
+        segment = np.ascontiguousarray(audio[:, pre_start:tail], dtype=np.float32)
+        if active:
+            segment = apply_scene(segment, sr, scene, state)
+        if cancel is not None and cancel.is_set():
+            raise Cancelled()
         if hasattr(df_state, "reset"):
             df_state.reset()
         with torch.inference_mode():
-            seg = enhance(model, df_state, src[:, a:b].contiguous(), atten_lim_db=atten_lim_db)
-        piece = seg.detach().cpu().numpy()[:, start - a: b - a]
+            enhanced = enhance(
+                model, df_state, torch.from_numpy(segment), atten_lim_db=atten_lim_db)
+        piece = np.ascontiguousarray(enhanced.detach().cpu().numpy(), dtype=np.float32)
+        if active and scene.uses_floor:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled()
+            piece = np.ascontiguousarray(soften_musical_noise(piece, sr, scene), dtype=np.float32)
+        expected = tail - pre_start
+        if piece.shape[-1] < expected:
+            piece = np.pad(piece, ((0, 0), (0, expected - piece.shape[-1])))
+        piece = piece[:, start - pre_start:tail - pre_start]
 
-        weight = np.ones(b - start, dtype=np.float32)
-        if k > 0:
-            m = min(xfade, b - start)
-            weight[:m] = np.linspace(0.0, 1.0, m, dtype=np.float32)
+        weight = np.ones(tail - start, dtype=np.float32)
+        if index > 0:
+            fade = min(xfade, tail - start)
+            weight[:fade] = np.linspace(0.0, 1.0, fade, dtype=np.float32)
         if not last:
-            m = b - end
-            weight[end - start:] *= np.linspace(1.0, 0.0, m, dtype=np.float32)
-        out[:, start:b] += piece * weight
-
+            fade = tail - end
+            weight[end - start:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        out[:, start:tail] += piece * weight
         if progress is not None:
-            progress((k + 1) / n_chunks)
+            progress((index + 1) / n_chunks)
     return out
 
 
@@ -498,11 +1279,13 @@ class AudioDeNoiserApp(ctk.CTk):
     def __init__(self, initial_file: str | None = None) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("860x760")
-        self.minsize(760, 700)
+        self.geometry("860x820")
+        self.minsize(760, 760)
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
+        saved_scene = self.settings.get("scene", "manual")
+        self._applied_scene = saved_scene if saved_scene in SCENES else "manual"
         self.output_dir = resolve_output_dir(self.settings.get("output_dir"))
         self.events: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
@@ -607,7 +1390,21 @@ class AudioDeNoiserApp(ctk.CTk):
         hint_opts = {"font": self._font(12), "text_color": C_MUTED, "anchor": "w"}
         row_pad = {"padx": 14, "pady": (8, 0)}
 
-        ctk.CTkLabel(panel, text="Noise reduction", **label_opts).grid(row=0, column=0, sticky="w", **row_pad)
+        self.scene_var = ctk.StringVar(value=SCENES[self._applied_scene].label)
+        ctk.CTkLabel(panel, text="Scene", **label_opts).grid(
+            row=0, column=0, sticky="w", **row_pad)
+        self.scene_menu = ctk.CTkOptionMenu(
+            panel, values=[SCENES[key].label for key in SCENE_ORDER],
+            variable=self.scene_var, width=220, command=self._on_scene_change,
+            fg_color=C_LINE, button_color=C_LINE, button_hover_color=C_LINE_HOVER,
+            text_color=C_TEXT, font=self._font(13))
+        self.scene_menu.grid(row=0, column=1, columnspan=2, sticky="w",
+                             padx=(0, 14), pady=(8, 0))
+        self.scene_hint = ctk.CTkLabel(
+            panel, text=SCENES[self._applied_scene].summary, wraplength=640, **hint_opts)
+        self.scene_hint.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14))
+
+        ctk.CTkLabel(panel, text="Noise reduction", **label_opts).grid(row=2, column=0, sticky="w", **row_pad)
         self.atten_index = int(self.settings.get("atten_index", len(ATTEN_STEPS) - 1))
         self.atten_index = max(0, min(len(ATTEN_STEPS) - 1, self.atten_index))
         self.atten_slider = ctk.CTkSlider(panel, from_=0, to=len(ATTEN_STEPS) - 1,
@@ -615,18 +1412,18 @@ class AudioDeNoiserApp(ctk.CTk):
                                           command=self._on_atten_change, progress_color=C_AMBER,
                                           button_color=C_AMBER, button_hover_color=C_AMBER_HOVER)
         self.atten_slider.set(self.atten_index)
-        self.atten_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
+        self.atten_slider.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(12, 0))
         self.atten_value = ctk.CTkLabel(panel, text="", width=90, **label_opts)
-        self.atten_value.grid(row=0, column=2, sticky="w", padx=(0, 14), pady=(8, 0))
+        self.atten_value.grid(row=2, column=2, sticky="w", padx=(0, 14), pady=(8, 0))
         ctk.CTkLabel(panel, text="Lower limits leave a little background in and sound more natural",
-                     **hint_opts).grid(row=1, column=1, columnspan=2, sticky="w")
+                     **hint_opts).grid(row=3, column=1, columnspan=2, sticky="w")
 
-        ctk.CTkLabel(panel, text="Rumble filter", **label_opts).grid(row=2, column=0, sticky="w", **row_pad)
+        ctk.CTkLabel(panel, text="Rumble filter", **label_opts).grid(row=4, column=0, sticky="w", **row_pad)
         self.highpass_var = ctk.StringVar(value=self.settings.get("highpass", "80 Hz"))
         if self.highpass_var.get() not in HIGHPASS_CHOICES:
             self.highpass_var.set("80 Hz")
         hp_row = ctk.CTkFrame(panel, fg_color="transparent")
-        hp_row.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        hp_row.grid(row=4, column=1, columnspan=2, sticky="w", pady=(8, 0))
         self.highpass_menu = ctk.CTkOptionMenu(hp_row, values=list(HIGHPASS_CHOICES),
                                                variable=self.highpass_var, width=110,
                                                command=lambda _v: self._save_settings(),
@@ -638,7 +1435,7 @@ class AudioDeNoiserApp(ctk.CTk):
                      **hint_opts).grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         switches = ctk.CTkFrame(panel, fg_color="transparent")
-        switches.grid(row=3, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 0))
+        switches.grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 0))
         self.postfilter_var = ctk.BooleanVar(value=bool(self.settings.get("post_filter", False)))
         self.postfilter_switch = ctk.CTkSwitch(switches, text="Post-filter for very noisy passages",
                                                variable=self.postfilter_var, font=self._font(13),
@@ -654,7 +1451,7 @@ class AudioDeNoiserApp(ctk.CTk):
         self.normalise_switch.grid(row=0, column=1, sticky="w")
 
         out_row = ctk.CTkFrame(panel, fg_color="transparent")
-        out_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=14, pady=(10, 12))
+        out_row.grid(row=6, column=0, columnspan=3, sticky="ew", padx=14, pady=(10, 12))
         out_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(out_row, text="Save to", **label_opts).grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.out_label = ctk.CTkLabel(out_row, text="", **hint_opts)
@@ -712,14 +1509,67 @@ class AudioDeNoiserApp(ctk.CTk):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    def _scene_key(self) -> str:
+        preset = SCENE_BY_LABEL.get(self.scene_var.get())
+        return preset.key if preset is not None else "manual"
+
+    def _remember_manual(self) -> None:
+        """Keep the Manual slider, rumble choice and post-filter for the return trip."""
+        self.settings["manual_highpass"] = self.highpass_var.get()
+        self.settings["manual_atten_index"] = self.atten_index
+        self.settings["manual_post_filter"] = bool(self.postfilter_var.get())
+
+    def _restore_manual(self) -> None:
+        highpass = self.settings.get("manual_highpass", "80 Hz")
+        if highpass not in HIGHPASS_CHOICES:
+            highpass = "80 Hz"
+        self.highpass_var.set(highpass)
+        index = int(self.settings.get("manual_atten_index", len(ATTEN_STEPS) - 1))
+        self.atten_index = max(0, min(len(ATTEN_STEPS) - 1, index))
+        self.atten_slider.set(self.atten_index)
+        self.postfilter_var.set(bool(self.settings.get("manual_post_filter", False)))
+        self._on_atten_change(self.atten_index)
+
+    def _on_scene_change(self, label: str) -> None:
+        preset = SCENE_BY_LABEL.get(label, MANUAL)
+        previous = SCENES.get(self._applied_scene, MANUAL)
+        if preset.active and not previous.active:
+            self._remember_manual()
+        # Set this before the slider moves. The slider callback saves settings, and
+        # the save must already know the scene is active or it will overwrite the
+        # Manual snapshot with the preset values.
+        self._applied_scene = preset.key
+        if preset.active:
+            if preset.atten_db in ATTEN_STEPS:
+                self.atten_index = ATTEN_STEPS.index(preset.atten_db)
+                self.atten_slider.set(self.atten_index)
+            self.postfilter_var.set(preset.post_filter)
+            self.highpass_var.set("Off")
+        else:
+            self._restore_manual()
+        self.scene_hint.configure(text=preset.summary)
+        self._save_settings()
+        self._refresh_controls()
+
     def _save_settings(self) -> None:
-        self.settings.update({
+        scene_key = self._scene_key() if hasattr(self, "scene_var") else "manual"
+        data = {
             "output_dir": str(self.output_dir),
             "atten_index": self.atten_index,
             "highpass": self.highpass_var.get(),
             "post_filter": bool(self.postfilter_var.get()),
             "normalise": bool(self.normalise_var.get()),
-        })
+            "scene": scene_key,
+        }
+        if not SCENES[scene_key].active:
+            data["manual_highpass"] = self.highpass_var.get()
+            data["manual_atten_index"] = self.atten_index
+            data["manual_post_filter"] = bool(self.postfilter_var.get())
+        else:
+            for key in ("manual_highpass", "manual_atten_index", "manual_post_filter"):
+                if key in self.settings:
+                    data[key] = self.settings[key]
+        self.settings.update(data)
         save_settings(self.settings)
 
     def _on_atten_change(self, value) -> None:
@@ -741,7 +1591,10 @@ class AudioDeNoiserApp(ctk.CTk):
         cancellable = self.busy == "denoise"
         self.cancel_btn.configure(state=on(cancellable),
                                   fg_color=C_DANGER if cancellable else C_LINE)
-        for widget in (self.atten_slider, self.highpass_menu, self.postfilter_switch,
+        scene_active = SCENES.get(self._applied_scene, MANUAL).active
+        self.scene_menu.configure(state=on(idle))
+        self.highpass_menu.configure(state=on(idle and not scene_active))
+        for widget in (self.atten_slider, self.postfilter_switch,
                        self.normalise_switch, self.change_btn):
             widget.configure(state=on(idle))
         can_play = has_file and sd is not None
@@ -805,6 +1658,7 @@ class AudioDeNoiserApp(ctk.CTk):
             "highpass": HIGHPASS_CHOICES[self.highpass_var.get()],
             "post_filter": bool(self.postfilter_var.get()),
             "normalise": bool(self.normalise_var.get()),
+            "scene": self._applied_scene,
         }
         self.cancel_event.clear()
         self.progress.set(0)
@@ -902,19 +1756,38 @@ class AudioDeNoiserApp(ctk.CTk):
 
     def _job_denoise(self, audio48, model, df_state, opts) -> None:
         put = self.events.put
+        preset = SCENES.get(opts.get("scene", "manual"), MANUAL)
         work = audio48
-        if opts["highpass"]:
+        if not preset.active and opts["highpass"]:
             work = highpass(work, MODEL_SR, opts["highpass"])
-        model.post_filter = opts["post_filter"]
-        limit = opts["atten"]
-        put(("log", "Denoising: noise reduction " + ("maximum" if limit is None else f"up to {limit} dB")
-                    + (f", rumble filter {opts['highpass']} Hz" if opts["highpass"] else "")
-                    + (", post-filter on" if opts["post_filter"] else "")))
-
-        started = time.perf_counter()
-        den48 = denoise(model, df_state, work, limit,
-                        progress=lambda f: put(("progress", f)), cancel=self.cancel_event)
-        elapsed = time.perf_counter() - started
+        previous_filter = bool(getattr(model, "post_filter", False))
+        previous_beta = getattr(model, "post_filter_beta", None)
+        den48 = None
+        elapsed = 0.0
+        try:
+            model.post_filter = opts["post_filter"]
+            if preset.active and previous_beta is not None:
+                model.post_filter_beta = preset.post_filter_beta
+            limit = opts["atten"]
+            detail = "Denoising: " + preset.label
+            detail += ", noise reduction " + ("maximum" if limit is None else f"up to {limit} dB")
+            if not preset.active and opts["highpass"]:
+                detail += f", rumble filter {opts['highpass']} Hz"
+            if opts["post_filter"]:
+                detail += ", post-filter on"
+            put(("log", detail))
+            started = time.perf_counter()
+            den48 = denoise(
+                model, df_state, work, limit, scene=preset if preset.active else None,
+                progress=lambda fraction: put(("progress", fraction)),
+                cancel=self.cancel_event)
+            elapsed = time.perf_counter() - started
+        finally:
+            model.post_filter = previous_filter
+            if previous_beta is not None:
+                model.post_filter_beta = previous_beta
+        if den48 is None:
+            return
 
         out = resample(den48, MODEL_SR, opts["src_sr"])
         # Resampling can be a sample out either way; match the source length exactly.

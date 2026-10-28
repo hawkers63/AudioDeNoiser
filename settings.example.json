@@ -4,5 +4,9 @@
   "highpass": "80 Hz",
   "post_filter": false,
   "normalise": true,
-  "last_dir": ""
+  "last_dir": "",
+  "scene": "manual",
+  "manual_highpass": "80 Hz",
+  "manual_atten_index": 9,
+  "manual_post_filter": false
 }
