@@ -9,8 +9,9 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | Version | Theme | Status |
 | --- | --- | --- |
 | 1.0.0 | Baseline desktop app, documentation and licence | Released 27 October 2026 |
-| 1.1.0 | Wind and traffic scene presets | Released 28 October 2026 (`main` and the `v1.1.0` tag are on GitHub). Has the edge-spike bug fixed in 1.2.0 |
-| 1.2.0 | Transient guard, floor gate, loudness-matched A/B, source bit depth | In the working tree, tested with the real model. Not committed. Mark's listening check pending |
+| 1.1.0 | Wind and traffic scene presets | Released 28 October 2026. Has the edge-spike bug fixed in 1.2.0 |
+| 1.2.0 | Transient guard, floor gate, loudness-matched A/B, source bit depth | Released 28 October 2026. Mark's listening check passed 28 October 2026 |
+| 1.2.1 | Faster Heavy Wind and Highway renders, identical output | Released 28 October 2026 |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -28,7 +29,7 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 Design note: `notes/01_Active/002_wind_traffic_scene_presets.md` (local only).
 
-Committed and tagged `v1.1.0` locally on 28 October 2026 after automated tests with the real DeepFilterNet 3 model. Pushing the commit and tag, publishing the GitHub Release and Mark's own listening check are still with Mark.
+Released on 28 October 2026 after automated tests with the real DeepFilterNet 3 model: `main`, the `v1.1.0` tag and the GitHub Release are on GitHub.
 
 Scope:
 
@@ -45,7 +46,7 @@ Done when:
 - [ ] Each preset passes the listening check described in the design note. Each preset ran cleanly on its clip with the real model and the measured band levels meet the expectations, but Mark's own listening check is still pending.
 - [x] `CHANGELOG.md` has a 1.1.0 entry, and the commit and tag are pushed.
 
-## 1.2.0 - Transient guard, floor gate and loudness-matched A/B (in progress)
+## 1.2.0 - Transient guard, floor gate and loudness-matched A/B (released 28 October 2026)
 
 Design note: `notes/01_Active/003_transient_gate_loudness.md`, with the implementation review beside it (both local only).
 
@@ -63,15 +64,34 @@ Done when:
 - [x] The patch is applied and the app starts cleanly. Verified by driving the real window end to end with the real model: open a 16-bit file, denoise on Highway, A/B gains set and toggled live, settings saved, layout checked at default and minimum size.
 - [x] Manual matches 1.1 exactly. Verified bit-identical (file and 48 kHz buffer) with DeepFilterNet 3 at maximum and 18 dB, on the three 1.1 clips and a 70 s multi-chunk file.
 - [x] Each new stage measured on synthetic and TTS speech: no false repairs on speech, clicks and pops removed, gate depth and speech cost, EBU Tech 3341 loudness cases, dither statistics.
-- [ ] Mark's listening check on `notes/listening/04_*` and `05_*` (see `EXPECTATIONS.md`), and on a real windy and a real traffic recording.
-- [ ] `CHANGELOG.md` 1.2.0 entry (drafted under Unreleased), commit, `v1.2.0` tag and GitHub Release, with Mark's approval.
+- [x] Mark's listening check on `notes/listening/04_*` and `05_*` (see `EXPECTATIONS.md`), and on a real windy and a real traffic recording. Passed 28 October 2026: works well, with some improvements noted for later. Because 1.2.1 audio is byte-identical to 1.2.0, this check holds for 1.2.1 too.
+- [x] `CHANGELOG.md` 1.2.0 entry, commit, `v1.2.0` tag and GitHub Release (published 28 October 2026).
+
+## 1.2.1 - Faster spectral floor (released 28 October 2026)
+
+Design note: `notes/01_Active/004_faster_wind_traffic restoration_with_identical_audio.md`, with the implementation review beside it (both local only).
+
+Scope:
+
+- The spectral floor on Heavy Wind and Highway takes its 5 × 7 median only over its own band (2-5 kHz and 1.2-4 kHz) and the two bins either side that the median reaches, instead of all 1,025 bins.
+- The output stays byte-identical to 1.2.0. No preset, setting, window or export change. Nothing new is installed.
+
+Done when:
+
+- [x] The change is applied and compiles cleanly (`py_compile`, pyflakes).
+- [x] Every scene matches 1.2.0 exactly with DeepFilterNet 3: 48 kHz buffer, saved file (SHA-256) and the reported loudness, peak and repairs, on nine files (mono and stereo, 44.1 and 48 kHz, 16 and 24-bit, one to four chunks).
+- [x] Manual still matches 1.1.0 exactly.
+- [x] Time measured: the stage is 2.5-3.3 times faster, and Heavy Wind and Highway renders 11-23 % faster on this laptop.
+- [x] Mark's go-ahead (28 October 2026): version 1.2.1, `CHANGELOG.md` cut, commit and `v1.2.1` tag. Push and GitHub Release are Mark's.
+- [x] Listening: output is byte-identical to 1.2.0, so Mark's passed 1.2.0 listening check (28 October 2026) holds for 1.2.1.
 
 ## Later
 
-Candidates noted during 1.2, not yet agreed:
+Candidates, not yet agreed:
 
-- The 1.1 spectral floor costs about 2 s per 30 s chunk, mostly its 2D median filter. It is the slowest stage on Heavy Wind and Highway and the first candidate for a speed-up.
+- Voicing (`estimate_voicing`) runs twice per chunk on Heavy Wind and Highway, once on the dry chunk and once on the network's output, at about 0.77 s a call. It is now the largest cost after DeepFilterNet itself, about a quarter of a Heavy Wind render.
 - On Pedestrian Street the floor gate needs its own voicing pass, which makes Street renders about 40 % slower than in 1.1. Reusing the voicing measured before the model would roughly halve that, at some cost in how well quiet harmonics are protected.
+- After `denoise()` returns, Cancel is no longer checked, so a Cancel pressed while the file is being written still saves it; and a failed write leaves a `.partial.wav` behind.
 
 Further work will be added here once agreed with Mark.
 

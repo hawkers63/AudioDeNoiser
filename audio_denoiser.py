@@ -86,7 +86,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.2"
+APP_VERSION = "1.2.1"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -784,6 +784,33 @@ def _protect_harmonics(
     return protect
 
 
+def _floor_peak_pull(magnitude: np.ndarray, sr: int, preset: ScenePreset) -> np.ndarray:
+    """How far each bin in the scene's band stands above its local median, in dB.
+
+    The local median is taken over 5 bins by 7 frames. The map covers the whole
+    grid, zero outside the band, because the smoothing after it spreads the
+    band's edges by a bin. Only the band's rows are filtered, plus the two rows
+    either side that their median reaches: the median is the costliest step in
+    the stage, and on the full grid most of it would go on rows the band then
+    discards. Each kept row sees the same 35 values it would on the full grid,
+    and a slice that reaches DC or Nyquist ends where the full grid does, so
+    its reflected edge is the same too. The map is bit-for-bit the full grid's.
+    """
+    pull_db = np.zeros_like(magnitude)
+    bin_hz = sr / FLOOR_FRAME
+    rows = np.arange(magnitude.shape[0])
+    band = np.flatnonzero(
+        (rows >= preset.floor_lo_hz / bin_hz) & (rows <= preset.floor_hi_hz / bin_hz))
+    if band.size == 0:
+        return pull_db
+    first, last = int(band[0]), int(band[-1]) + 1
+    lo, hi = max(0, first - 2), min(magnitude.shape[0], last + 2)
+    smoothed = median_filter(magnitude[lo:hi], size=(5, 7), mode="reflect")[first - lo:last - lo]
+    excess_db = 20 * np.log10((magnitude[first:last] + 1e-8) / (smoothed + 1e-8))
+    pull_db[first:last] = np.clip(excess_db - preset.floor_peak_db, 0.0, preset.floor_max_db)
+    return pull_db
+
+
 def soften_musical_noise(
     audio: np.ndarray,
     sr: int,
@@ -814,14 +841,7 @@ def soften_musical_noise(
         padded=False,
     )
     magnitude = np.abs(mid_spectrum)
-    smoothed = median_filter(magnitude, size=(5, 7))
-    excess_db = 20 * np.log10((magnitude + 1e-8) / (smoothed + 1e-8))
-    pull_db = np.clip(excess_db - preset.floor_peak_db, 0.0, preset.floor_max_db)
-    bin_hz = sr / FLOOR_FRAME
-    band = (np.arange(magnitude.shape[0]) >= preset.floor_lo_hz / bin_hz) & (
-        np.arange(magnitude.shape[0]) <= preset.floor_hi_hz / bin_hz
-    )
-    pull_db *= band[:, None]
+    pull_db = _floor_peak_pull(magnitude, sr, preset)
     if voicing is None:
         periodicity, f0 = estimate_voicing(mid, sr)
         periodicity = _debounce_voicing(periodicity)

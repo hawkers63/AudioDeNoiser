@@ -143,6 +143,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| [1.2.1](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.1) | 28 October 2026 | Heavy Wind & Gusts and Highway / Traffic Drone render 11-23 % faster; output byte-identical to 1.2.0 |
 | [1.2.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.0) | 28 October 2026 | Transient guard (click and pop repair), floor gate, loudness-matched A/B and source bit-depth export with dithered 16-bit. Fixes the 1.1.0 buffer-edge spike. Manual matches 1.1 exactly |
 | [1.1.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0) | 28 October 2026 | Wind and traffic scene presets: Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean. Manual matches 1.0 exactly |
 | [1.0.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.0.0) | 27 October 2026 | First release: DeepFilterNet 3 restoration, rumble filter, chunked processing, A/B auditioning and 24-bit output |

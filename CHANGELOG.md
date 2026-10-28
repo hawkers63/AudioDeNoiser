@@ -6,6 +6,12 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-28
+
+### Changed
+
+- Heavy Wind & Gusts and Highway / Traffic Drone render 11-23 % faster, about a second less per 30 s of audio, with exactly the same output. The spectral floor that softens isolated hiss-band peaks after the network took a 5 × 7 median over all 1,025 frequency bins and then kept only its own band; it now filters just that band (2-5 kHz on Heavy Wind, 1.2-4 kHz on Highway) and the two bins either side that the median reaches. The stage itself is 2.5-3.3 times faster. Verified with DeepFilterNet 3: the 48 kHz buffer and the saved file are byte-identical to 1.2.0 on every scene, mono and stereo, 44.1 and 48 kHz, 16 and 24-bit, one to four chunks.
+
 ## [1.2.0] - 2026-10-28
 
 Manual output is unchanged: verified bit-identical to 1.1.0 with DeepFilterNet 3, file and 48 kHz buffer, on the listening clips and a 70 s multi-chunk file.
@@ -64,7 +70,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.1.0
 [1.0.0]: https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.0.0
