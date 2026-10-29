@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.6.0-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.7.0-F2A93B)
 
 </div>
 
@@ -27,6 +27,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 | --- | --- |
 | Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum. Save preset… adds the controls on screen to that list under a name you choose |
 | Dialogue lift | Off, Gentle or Clear. Raises consonants a few metres away after the model. Off, the default everywhere except Conversation, leaves the audio untouched |
+| Restore consonants | Off by default, and not part of a saved preset. On voiced frames only, puts back presence and consonants that processing made darker than the dry balance against the vowel. On the measured helmet take the clearer pass left this switch off |
 | Subtitles | Optional English transcript. Read speech transcribes the buffer you are hearing, without denoising first. The switch transcribes the denoised audio after Denoise, without waiting for a WAV. Words follow the playhead, and Save text writes an SRT and a plain transcript |
 | Save denoised | Denoise keeps the result in memory. Save denoised… writes the WAV when you ask, at the source rate and bit depth. Closing, opening another file, or denoising again asks before an unsaved pass is dropped |
 | Waveform range | Shift-drag marks a stretch of the waveform. Loop plays it until Stop. Cut removes it from this session only. Save selection writes that stretch on its own, at the source rate and bit depth |
@@ -44,7 +45,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 
 1. Decode WAV, MP3, FLAC or OGG with `soundfile` and resample to 48 kHz.
 2. **Manual** is the 1.0 chain: optionally high-pass filter to remove wind and traffic rumble below 60 to 120 Hz, then hand the audio to the model. A **named scene** does not use that switch. Inside each chunk, Heavy Wind and Highway first repair isolated clicks and low pops (the transient guard). Every named scene then runs an infrasonic filter, ducks gust energy under the scene's split while the fragment is unvoiced, and pulls down a steady idle tone or a confirmed 50/100 Hz hum.
-3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway, Pedestrian Street and Conversation lower the steady residual floor (the floor gate). If Dialogue is Gentle or Clear, the consonant band is then lifted. All of that happens before the crossfade.
+3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway, Pedestrian Street and Conversation lower the steady residual floor (the floor gate). If Dialogue is Gentle or Clear, the consonant band is then lifted. If Restore consonants is on, voiced presence and air that went darker than the dry balance are put back, and unvoiced frames are left alone. All of that happens before the crossfade.
 4. The denoised audio stays in the session. **Save denoised…** resamples it back to the source rate, optionally peak-normalises, and writes a WAV at the source's bit depth (24-bit for MP3 and OGG). The suggested name is `<name>_denoised.wav` in the Save to folder. Denoise itself does not write that file.
 5. For A/B playback, the integrated loudness of both versions is measured (ITU-R BS.1770-4) and, if **Match A/B loudness** is on, the denoised copy plays at the original's loudness. The saved file is never touched by this.
 6. Shift-drag on the waveform marks a range. Loop repeats it, Cut drops it from the session (the file on disk stays as it was), and Save selection writes that range alone. Read speech transcribes whichever buffer you are hearing.
@@ -154,6 +155,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| [1.7.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.7.0) | 29 October 2026 | Restore consonants, off by default and not part of a saved preset. With the switch off, Manual and the 1.6.0 scenes are unchanged. On the measured helmet take the off pass was the clearer one |
 | [1.6.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.6.0) | 29 October 2026 | Save preset… adds the controls on screen to the scene list under a name you choose. The denoiser is unchanged |
 | [1.5.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.5.0) | 29 October 2026 | Save denoised… writes the WAV when you ask. Denoise keeps the result in memory. The denoiser is unchanged |
 | [1.4.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.4.0) | 29 October 2026 | Mark a waveform range to loop it, cut it from the session, or save it on its own. Read speech transcribes the buffer you are hearing. The denoiser is unchanged |

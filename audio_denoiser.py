@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.6
+Audio DeNoiser 1.7
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -37,6 +37,9 @@ How the processing chain works
    Wind, Highway, Street and Conversation lower the steady residual floor (the
    floor gate). Conversation, and any scene whose Dialogue control is above Off,
    then lifts the consonant band on voiced frames and on consonants beside a vowel.
+   Restore consonants is a separate switch, off unless it is turned on. It then
+   puts back presence and air that processing made darker than the dry balance
+   against the vowel, and only on voiced frames.
 4. The denoised audio stays in the session. Save denoised… resamples it back to
    the source rate, optionally peak-normalises, and writes a WAV at the source's
    bit depth (24-bit for MP3 and OGG). Denoise itself does not write that file.
@@ -94,7 +97,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -252,6 +255,13 @@ DIALOGUE_SILENCE_DBFS = -50.0   # time-domain frame RMS; a quiet consonant still
 DIALOGUE_FLOOR_BIAS = 1.2
 DIALOGUE_EDGE_BINS = 4
 DIALOGUE_CEILING = 0.99
+# Consonant restore. Off leaves every sample untouched. The cap is a guard
+# above one file's measured gap, not a target fitted to that file. The share
+# puts back the whole darkened gap up to the dry balance, and no further.
+RESTORE_MAX_DB = 12.0
+RESTORE_SNAP_DB = 0.3
+RESTORE_SHARE = 1.0
+RESTORE_BODY_MARGIN_DB = 30.0
 LIFT_GENTLE_DB = 3.0
 LIFT_CLEAR_DB = 6.0
 LIFT_CHOICES = {"Off": 0.0, "Gentle": LIFT_GENTLE_DB, "Clear": LIFT_CLEAR_DB}
@@ -1508,6 +1518,132 @@ def apply_dialogue_lift(
     return np.ascontiguousarray(lifted, dtype=np.float32)
 
 
+def apply_consonant_restore(
+    dry: np.ndarray,
+    processed: np.ndarray,
+    sr: int,
+    voicing: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Bring voiced presence and air back towards the dry balance. Never cut.
+
+    ``dry`` is the chunk before the network. ``processed`` is that chunk after
+    the network, the floor, the gate and the dialogue lift. ``voicing`` is the
+    dry chunk's detector output: the network's own output is voiced in pauses
+    the dry recording is not. A band is boosted only where the processed tilt
+    against the vowel body is darker than the dry tilt, and only up to the dry
+    band's own level. Unvoiced frames are left exactly as they are, so wind and
+    hiss stay down. A chunk that needs nothing is returned as the same array.
+    """
+    if sr != MODEL_SR or dry.ndim != 2 or processed.ndim != 2:
+        raise ValueError(
+            f"Consonant restore expected {MODEL_SR} Hz audio shaped (channels, frames).")
+    if dry.shape != processed.shape:
+        raise ValueError("Consonant restore expected the dry and processed chunks to share a shape.")
+    if processed.shape[-1] < DIALOGUE_FRAME * 4:
+        return processed
+    if not np.isfinite(dry).all() or not np.isfinite(processed).all():
+        raise ValueError("Consonant restore was given invalid samples.")
+
+    dry64 = np.asarray(dry, dtype=np.float64)
+    proc64 = np.asarray(processed, dtype=np.float64)
+    dry_mono = np.ascontiguousarray(dry64.mean(axis=0), dtype=np.float64)
+    proc_mono = np.ascontiguousarray(proc64.mean(axis=0), dtype=np.float64)
+    _freqs, _times, dry_spec = stft(
+        dry_mono, fs=sr, window="hann", nperseg=DIALOGUE_FRAME,
+        noverlap=DIALOGUE_FRAME - DIALOGUE_HOP, boundary=None, padded=False)
+    _freqs, _times, proc_spec = stft(
+        proc_mono, fs=sr, window="hann", nperseg=DIALOGUE_FRAME,
+        noverlap=DIALOGUE_FRAME - DIALOGUE_HOP, boundary=None, padded=False)
+    dry_mag = np.abs(dry_spec)
+    proc_mag = np.abs(proc_spec)
+    n_bins, n_times = proc_mag.shape
+    if n_times == 0 or dry_mag.shape != proc_mag.shape:
+        return processed
+
+    body = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_BODY)
+    presence = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_PRESENCE)
+    air = _band_slice(n_bins, sr, DIALOGUE_FRAME, *DIALOGUE_AIR)
+
+    def _power(magnitude: np.ndarray, rows: slice) -> np.ndarray:
+        return np.mean(magnitude[rows] ** 2, axis=0)
+
+    def _db(power: np.ndarray) -> np.ndarray:
+        return 10.0 * np.log10(np.maximum(power, 1e-12))
+
+    def _frame_db(mono: np.ndarray) -> np.ndarray:
+        squared = mono * mono
+        cumulative = np.empty(squared.size + 1, dtype=np.float64)
+        cumulative[0] = 0.0
+        np.cumsum(squared, out=cumulative[1:])
+        starts = np.arange(n_times, dtype=np.int64) * DIALOGUE_HOP
+        stops = np.minimum(starts + DIALOGUE_FRAME, mono.size)
+        frame_ms = (cumulative[stops] - cumulative[starts]) / DIALOGUE_FRAME
+        with np.errstate(divide="ignore"):
+            return 10.0 * np.log10(np.maximum(frame_ms, 1e-12))
+
+    if voicing is None:
+        periodicity, _f0 = estimate_voicing(proc_mono, sr)
+        periodicity = _debounce_voicing(periodicity)
+    else:
+        periodicity = np.asarray(voicing[0], dtype=np.float64)
+    if periodicity.size:
+        source = np.arange(periodicity.size) * VOICE_HOP + VOICE_FRAME / 2
+        target = np.arange(n_times) * DIALOGUE_HOP + DIALOGUE_FRAME / 2
+        period = np.interp(target, source, periodicity, left=0.0, right=0.0)
+    else:
+        period = np.zeros(n_times, dtype=np.float64)
+    voiced = period >= VOICING_MIN
+    audible = (_frame_db(dry_mono) >= DIALOGUE_SILENCE_DBFS) & (
+        _frame_db(proc_mono) >= DIALOGUE_SILENCE_DBFS)
+    margin = 10.0 ** (-RESTORE_BODY_MARGIN_DB / 10.0)
+
+    def _deficit(rows: slice) -> tuple[np.ndarray, np.ndarray]:
+        dry_band = _power(dry_mag, rows)
+        proc_band = _power(proc_mag, rows)
+        dry_body = _power(dry_mag, body)
+        proc_body = _power(proc_mag, body)
+        usable = (
+            (dry_body > np.maximum(dry_band, 1e-12) * margin)
+            & (proc_body > np.maximum(proc_band, 1e-12) * margin))
+        gap = (_db(dry_band) - _db(dry_body)) - (_db(proc_band) - _db(proc_body))
+        absolute = _db(dry_band) - _db(proc_band)
+        deficit = np.minimum(gap, absolute) * RESTORE_SHARE
+        deficit = np.clip(deficit, 0.0, RESTORE_MAX_DB)
+        active = voiced & audible & usable
+        deficit = np.where(active, deficit, 0.0)
+        return np.where(deficit < RESTORE_SNAP_DB, 0.0, deficit), active
+
+    presence_db, presence_on = _deficit(presence)
+    air_db, air_on = _deficit(air)
+    gain = np.ones((n_bins, n_times), dtype=np.float64)
+    gain[presence] = 10.0 ** (presence_db / 20.0)
+    gain[air] = 10.0 ** (air_db / 20.0)
+    _cosine_fade(gain, presence, DIALOGUE_EDGE_BINS)
+    _cosine_fade(gain, air, DIALOGUE_EDGE_BINS)
+    gain = uniform_filter1d(gain, size=5, axis=1, mode="nearest")
+    # The running sum can undershoot. This stage never cuts, so stay at unity or above.
+    gain = np.clip(gain, 1.0, 10.0 ** (RESTORE_MAX_DB / 20.0))
+    # Smoothing must not leak a boost into a pause or an unusable frame.
+    gain[presence, ~presence_on] = 1.0
+    gain[air, ~air_on] = 1.0
+    near_unity = np.abs(gain - 1.0) < (10.0 ** (RESTORE_SNAP_DB / 20.0) - 1.0)
+    gain = np.where(near_unity, 1.0, gain)
+    if np.all(gain == 1.0):
+        return processed
+
+    restored = _apply_spectral_gain(
+        processed, sr, gain - 1.0, DIALOGUE_FRAME, DIALOGUE_HOP)
+    # _limit_lift returns its dry argument unchanged when that argument is
+    # already hot, which would throw this restore away. Limit only a chunk
+    # that still has headroom. The dialogue lift keeps the shared limiter.
+    peak = float(np.max(np.abs(processed))) if processed.size else 0.0
+    if peak < DIALOGUE_CEILING:
+        restored = _limit_lift(processed, restored)
+    if not np.isfinite(restored).all():
+        raise ValueError("Consonant restore produced invalid samples.")
+    return np.ascontiguousarray(restored, dtype=np.float32)
+
+
 def apply_scene(
     audio: np.ndarray, sr: int, preset: ScenePreset, state: ConditionerState | None = None
 ) -> np.ndarray:
@@ -1968,6 +2104,7 @@ def load_model():
 def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
             scene: ScenePreset | None = None,
             lift_db: float = 0.0,
+            restore: bool = False,
             progress=None, cancel: threading.Event | None = None,
             stats: dict | None = None) -> np.ndarray:
     """Run DeepFilterNet over 48 kHz audio (channels, frames) in overlapping chunks.
@@ -1976,9 +2113,11 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
     Manual passes the audio through unchanged, so today's slider and rumble
     settings keep today's results. ``lift_db`` above zero restores consonant
     presence after the network; zero leaves the chunk untouched by that stage.
-    The torch tensor is one chunk, not the file. ``stats``, if given, gains
-    "clicks" and "pops": the transients repaired, each counted once, in the
-    chunk whose output keeps it.
+    ``restore`` compares that result with the dry chunk and puts back voiced
+    presence and air that went darker than the dry balance. False, the default,
+    does not call that stage. The torch tensor is one chunk, not the file.
+    ``stats``, if given, gains "clicks" and "pops": the transients repaired,
+    each counted once, in the chunk whose output keeps it.
     """
     import torch
     from df.enhance import enhance
@@ -2024,7 +2163,8 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
                 model, df_state, torch.from_numpy(segment), atten_lim_db=atten_lim_db)
         piece = np.ascontiguousarray(enhanced.detach().cpu().numpy(), dtype=np.float32)
         wants_lift = lift_db > 0.0
-        if (active and (scene.uses_floor or scene.uses_gate)) or wants_lift:
+        wants_restore = bool(restore)
+        if (active and (scene.uses_floor or scene.uses_gate)) or wants_lift or wants_restore:
             if cancel is not None and cancel.is_set():
                 raise Cancelled()
             # Voicing of the network's output, measured once for every stage.
@@ -2044,6 +2184,24 @@ def denoise(model, df_state, audio: np.ndarray, atten_lim_db,
                     raise Cancelled()
                 piece = np.ascontiguousarray(
                     apply_dialogue_lift(piece, sr, lift_db, voicing), dtype=np.float32)
+            if wants_restore:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled()
+                # Match the dry chunk only while the stage is on. The pad below
+                # is unchanged when the stage is off, so Manual stays identical.
+                target = segment.shape[-1]
+                if piece.shape[-1] < target:
+                    piece = np.pad(piece, ((0, 0), (0, target - piece.shape[-1])))
+                elif piece.shape[-1] > target:
+                    piece = piece[:, :target]
+                # The network's own output is voiced in pauses the dry recording
+                # is not. Follow the dry chunk, or those pauses brighten.
+                dry_mid = np.ascontiguousarray(segment.mean(axis=0), dtype=np.float64)
+                dry_period, dry_f0 = estimate_voicing(dry_mid, sr)
+                piece = np.ascontiguousarray(
+                    apply_consonant_restore(
+                        segment, piece, sr, (_debounce_voicing(dry_period), dry_f0)),
+                    dtype=np.float32)
         expected = tail - pre_start
         if piece.shape[-1] < expected:
             piece = np.pad(piece, ((0, 0), (0, expected - piece.shape[-1])))
@@ -2737,10 +2895,10 @@ class AudioDeNoiserApp(ctk.CTk):
     def __init__(self, initial_file: str | None = None) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("860x1020")
+        self.geometry("860x1054")
         # Measured with Save preset… on the scene row: the waveform is 129 px at
         # 1001 and 130 px at 1002. The default 1020 still shows the log.
-        self.minsize(760, 1002)
+        self.minsize(760, 1036)
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
@@ -2998,6 +3156,12 @@ class AudioDeNoiserApp(ctk.CTk):
             font=self._font(13), text_color=C_TEXT, progress_color=C_AMBER,
             command=self._save_settings)
         self.subtitles_switch.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.restore_var = ctk.BooleanVar(value=bool(self.settings.get("consonant_restore", False)))
+        self.restore_switch = ctk.CTkSwitch(
+            switches, text="Restore consonants", variable=self.restore_var,
+            font=self._font(13), text_color=C_TEXT, progress_color=C_AMBER,
+            command=self._save_settings)
+        self.restore_switch.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         out_row = ctk.CTkFrame(panel, fg_color="transparent")
         out_row.grid(row=7, column=0, columnspan=3, sticky="ew", padx=14, pady=(10, 12))
@@ -3315,6 +3479,8 @@ class AudioDeNoiserApp(ctk.CTk):
             data["dialogue_lift"] = self.lift_var.get().lower()
         if hasattr(self, "subtitles_var"):
             data["subtitles"] = bool(self.subtitles_var.get())
+        if hasattr(self, "restore_var"):
+            data["consonant_restore"] = bool(self.restore_var.get())
         if not SCENES[scene_key].active:
             data["manual_highpass"] = self.highpass_var.get()
             data["manual_atten_index"] = self.atten_index
@@ -3400,7 +3566,8 @@ class AudioDeNoiserApp(ctk.CTk):
         self.lift_menu.configure(state=on(idle))
         self.highpass_menu.configure(state=on(idle and not scene_active))
         for widget in (self.atten_slider, self.postfilter_switch,
-                       self.normalise_switch, self.subtitles_switch, self.change_btn):
+                       self.normalise_switch, self.subtitles_switch,
+                       self.restore_switch, self.change_btn):
             widget.configure(state=on(idle))
         self.save_text_btn.configure(state=on(bool(self._cues) and self.transcript_path() is not None))
         has_sel = self._selection is not None
@@ -3769,6 +3936,7 @@ class AudioDeNoiserApp(ctk.CTk):
             "scene": self._applied_scene,
             "subtype": self.source_subtype or "PCM_24",
             "lift_db": LIFT_CHOICES.get(self.lift_var.get(), 0.0),
+            "consonant_restore": bool(self.restore_var.get()),
             "subtitles": bool(self.subtitles_var.get()),
             "write_file": False,
         }
@@ -3965,6 +4133,7 @@ class AudioDeNoiserApp(ctk.CTk):
         elapsed = 0.0
         stats: dict[str, int] = {}
         lift_db = float(opts.get("lift_db", 0.0) or 0.0)
+        restore = bool(opts.get("consonant_restore", False))
         try:
             model.post_filter = opts["post_filter"]
             if preset.active and previous_beta is not None:
@@ -3980,11 +4149,13 @@ class AudioDeNoiserApp(ctk.CTk):
                 detail += ", dialogue clear"
             elif lift_db > 0.0:
                 detail += ", dialogue gentle"
+            if restore:
+                detail += ", consonant restore on"
             put(("log", detail))
             started = time.perf_counter()
             den48 = denoise(
                 model, df_state, work, limit, scene=preset if preset.active else None,
-                lift_db=lift_db,
+                lift_db=lift_db, restore=restore,
                 progress=lambda fraction: put(("progress", fraction)),
                 cancel=self.cancel_event, stats=stats)
             elapsed = time.perf_counter() - started

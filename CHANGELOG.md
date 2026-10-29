@@ -6,6 +6,18 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-29
+
+With Restore consonants left off, which is how it ships, Manual and every scene shipped in 1.6.0 are unchanged. The switch is not stored in a named preset. On the measured helmet take, the pass with the switch off was the clearer one. Further samples may be tried later. They are not part of this release.
+
+### Added
+
+- **Restore consonants**, off by default. After the dialogue lift, on voiced frames only, it puts back presence (1.8–4 kHz) and consonants (4–6.5 kHz) that processing made darker than the dry balance against the vowel. It does not go brighter than the dry frame, and it leaves pauses alone. The switch is not stored in a named preset. With the switch off, Manual and the scenes shipped in 1.6.0 are unchanged. On the measured helmet take, the pass with the switch off was the clearer one, so the switch stays off.
+
+### Changed
+
+- The window is 860×1054, and the smallest size is 760×1036, so the Restore consonants row, the waveform and the log all remain visible.
+
 ## [1.6.0] - 2026-10-29
 
 Manual, and every scene shipped in 1.5.0, is unchanged. Denoise still does the same work. A named preset remembers the controls on screen. It does not change the samples. The consonant darkening measured on one outdoor take is not repaired here. That work is scheduled as 1.7.0.
@@ -125,7 +137,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...v1.4.0

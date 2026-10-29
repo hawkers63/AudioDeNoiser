@@ -16,7 +16,7 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | 1.4.0 | Waveform range: loop, cut from the session, save the range, read speech | Released 29 October 2026. The denoiser is unchanged |
 | 1.5.0 | Save the denoised audio when asked | Released 29 October 2026. The denoiser is unchanged |
 | 1.6.0 | Named presets in the scene list | Released 29 October 2026. The denoiser is unchanged |
-| 1.7.0 | Voice clarity on voiced frames | Scheduled 29 October 2026. Not started. A measurement of one file, not a listening pass |
+| 1.7.0 | Voice clarity on voiced frames | Released 29 October 2026. Restore consonants ships off. On the measured helmet take Mark preferred that off pass. Further samples may follow |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -163,7 +163,7 @@ Done when:
 - [x] The window is measured with Save preset… and Delete on the scene row. Requested size stays 721×1026. At 860×1020 the waveform is 148 px and the log is on screen. The smallest height is 1002: the waveform is 130 px there and 129 px at 1001. At 760×1002 the scene row stays on one line and Delete stays inside the window. Default size stays 860×1020.
 - [x] `CHANGELOG.md` has a 1.6.0 entry, and the commit, `v1.6.0` tag and GitHub Release are published.
 
-## 1.7.0 - Voice clarity on voiced frames (scheduled, not started)
+## 1.7.0 - Voice clarity on voiced frames (released)
 
 Design note: `notes/01_Active/008_user_presets_and_speech_crispness.md`, section 4.2 (local only). Mark scheduled this on 29 October 2026, when he released 1.6.0. It is not in 1.6.0. Named presets do not change a single sample, so Conversation still darkens the consonants on the measured file.
 
@@ -187,12 +187,26 @@ Scope:
 - A preview of this pair, stage on and stage off, reported in the table above, before the stage can be a default. Factory scenes stay bit-identical while it is off.
 - `denoise()` is touched only when this stage is actually built.
 
+The stage ships in 1.7.0, off unless **Restore consonants** is on. It is not part of a saved preset. The window is 860×1054, and the smallest height is 1036, measured after that switch row. A preview of this pair, Conversation at 18 dB with Clear and the post-filter off, is at `D:\Audio\Denoised\01_preview_off.wav` and `01_preview_on.wav`. `01_denoised.wav` was not overwritten. Voiced frames, same count of 587:
+
+| Band | Off, against the vowel | On, against the vowel |
+| --- | --- | --- |
+| 20–80 Hz | −14.8 dB | −14.8 dB |
+| 80–200 Hz | −8.9 dB | −8.9 dB |
+| 300 Hz–1 kHz, the vowel | — | — |
+| 1.8–4 kHz, presence | −4.3 dB | −1.2 dB |
+| 4–6.5 kHz, consonants | −7.4 dB | −1.7 dB |
+
+The off column matches the table above. The absolute "change" column on the on file sits about 1.2 dB lower because peak-normalise followed a higher peak. Pauses more than a quarter of a second from speech move about half a decibel in the consonant band. The rumble bands do not.
+
+Mark listened to both files on 29 October 2026. He prefers `01_preview_off.wav`: it distinguishes the speech. `01_preview_on.wav` takes out too much and the voice is less clear. The spectrum had moved the consonant band towards the original; his ears do not want that pass. Restore consonants stays off. It does not become the default. Conversation and the Clear cap stay as they are. He will add more samples to the designated folders as they become available. A later pass is possible. It is not this release.
+
 Done when:
 
-- [ ] The stage is built, off by default, and a preview of this pair is rendered with it on and off.
-- [ ] Mark has listened to that preview. The table is filled again for both passes. This measurement is not that listening check.
-- [ ] Manual, and Dialogue Off on the scenes shipped in 1.6.0, stay bit-identical while the stage is off.
-- [ ] `CHANGELOG.md` has a dated 1.7.0 entry, and the commit, tag and GitHub Release are published. Not until Mark says proceed.
+- [x] The stage is built, off by default, and a preview of this pair is rendered with it on and off.
+- [x] Mark has listened to that preview. He prefers the off pass. The table above is the measurement for both passes. The listening result stands over that table.
+- [x] Manual, and Dialogue Off on the scenes shipped in 1.6.0, stay bit-identical while the stage is off.
+- [x] `CHANGELOG.md` has a dated 1.7.0 entry, and the commit, `v1.7.0` tag and GitHub Release are published.
 
 ## Later
 

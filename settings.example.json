@@ -12,6 +12,7 @@
   "manual_post_filter": false,
   "dialogue_lift": "off",
   "subtitles": false,
+  "consonant_restore": false,
   "user_presets": [],
   "selected_preset": ""
 }
