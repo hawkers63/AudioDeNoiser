@@ -6,9 +6,20 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
-### Planned
+## [1.5.0] - 2026-10-29
 
-- **1.5.0.** Denoise keeps the result in memory. A Save control writes the WAV when you ask, to a name you choose, with the same samples 1.4.0 writes on its own today. Closing the window, opening another file, or running Denoise again asks before an unsaved pass is dropped. The opened file cannot be chosen as the destination.
+Manual, and every scene shipped in 1.4.0, is unchanged. Denoise still does the same work. What changed is when the WAV is written.
+
+### Added
+
+- **Save denoised…** on the action row, between Denoise and Cancel. It asks for a file name, suggests `<name>_denoised.wav` in the Save to folder, and writes that WAV at the source rate and bit depth. Choosing another folder in the dialog does not change the Save to preference. The file you opened cannot be chosen as the destination. A failed write removes its temporary file and leaves the session unsaved.
+- Closing the window, opening another file, or pressing Denoise again asks before an unsaved pass is dropped. Yes writes the file and then continues. No drops the pass. Cancel leaves the session as it is. The window stays open while a save is still being written.
+
+### Changed
+
+- **Denoise no longer writes a WAV.** The result stays in memory, and B plays that 48 kHz buffer. **Normalise saved file to −1 dBFS** applies when you save, not when Denoise finishes, so turning it on or off after a render changes the file you would write and leaves playback as it was. Match A/B loudness is still playback only.
+- The **English transcript after denoise** switch still reads the denoised audio after Denoise, and it no longer waits for a WAV. Save text writes `<name>_transcript.srt` and `.txt` until a denoised WAV has been saved, then writes beside that WAV.
+- Cutting a session that has denoised audio marks that export unsaved, because the WAV on disk would be the uncut take. Undo puts the audio back and restores whether it still needed saving.
 
 ## [1.4.0] - 2026-10-29
 
@@ -106,7 +117,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.0...v1.2.1

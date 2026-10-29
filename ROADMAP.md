@@ -12,9 +12,9 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | 1.1.0 | Wind and traffic scene presets | Released 28 October 2026. Has the edge-spike bug fixed in 1.2.0 |
 | 1.2.0 | Transient guard, floor gate, loudness-matched A/B, source bit depth | Released 28 October 2026. Mark's listening check passed 28 October 2026 |
 | 1.2.1 | Faster Heavy Wind and Highway renders, identical output | Released 28 October 2026 |
-| 1.3.0 | Dialogue lift, Conversation (1–5 m), playback subtitles | Released 28 October 2026. Listening check on real 1–5 m speech is still open |
+| 1.3.0 | Dialogue lift, Conversation (1–5 m), playback subtitles | Released 28 October 2026. Listening check passed 29 October 2026: works well on a real 1–5 metre take |
 | 1.4.0 | Waveform range: loop, cut from the session, save the range, read speech | Released 29 October 2026. The denoiser is unchanged |
-| 1.5.0 | Save the denoised audio when asked | Planned. Not started |
+| 1.5.0 | Save the denoised audio when asked | Released 29 October 2026. The denoiser is unchanged |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -104,7 +104,7 @@ Done when:
 - [x] The two lift constants are measured and frozen: target tilt −23.0 dB, floor bias 1.2.
 - [x] Manual matches 1.1.0 exactly (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three listening clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match on the clips and the 70 s file. The TTS file is 16-bit here and was 24-bit in 1.1, which is the 1.2 export rule.
 - [x] Heavy Wind, Highway, Pedestrian Street and Subtle Podcast Clean, Dialogue Off, match frozen 1.2.0 (the same audio as 1.2.1) on those three clips and the TTS file: 48 kHz buffer and saved file byte-identical, 16 of 16. Conversation rendered on the TTS file without error. That is not a listening check.
-- [ ] Mark's listening check: a real conversation at about 1–5 m, in wind and in traffic, Dialogue Clear against Off, on Conversation and on Highway with the menu set to Clear. Synthetic clips and text-to-speech are not this check.
+- [x] Mark's listening check: a real conversation at about 1–5 m, in wind and in traffic, Dialogue Clear against Off, on Conversation and on Highway with the menu set to Clear. Synthetic clips and text-to-speech are not this check. Passed 29 October 2026: Mark confirmed it works well on a real 1–5 metre take. He did not report a separate Clear-against-Off score for each scene.
 
 ## 1.4.0 - Waveform range and a transcript you can read (released 29 October 2026)
 
@@ -125,9 +125,9 @@ Done when:
 - [x] The window is measured: requested 721×1020. At 860×1020 and at 760×996 the log's last line is visible and the waveform is at least 130 px. The five buttons sit on one row at 760 wide.
 - [x] `CHANGELOG.md` has a 1.4.0 entry, and the commit, `v1.4.0` tag and GitHub Release are published.
 
-## 1.5.0 - Save the denoised audio when asked (planned)
+## 1.5.0 - Save the denoised audio when asked (released 29 October 2026)
 
-Design note: `notes/01_Active/007_manual_save_denoised.md` (local only). Not started. Booked as 1.5.0 on 29 October 2026, after 1.4.0.
+Design note: `notes/01_Active/007_manual_save_denoised.md` (local only). Mark's go-ahead was 29 October 2026.
 
 Scope:
 
@@ -139,10 +139,10 @@ Scope:
 
 Done when:
 
-- [ ] The patch is applied and the export of an unchanged pass matches a 1.4.0 file byte for byte.
-- [ ] A denoise from the window leaves no WAV until Save is used.
-- [ ] Manual still matches 1.1.0, and the four released scenes with Dialogue Off still match frozen 1.2.0.
-- [ ] Mark's go-ahead, then `CHANGELOG.md`, the commit, the `v1.5.0` tag and the GitHub Release.
+- [x] The patch is applied and the export of an unchanged pass matches the 1.4.0 write block byte for byte. `notes/tests/save_150.py`: normalise on and off, 16-bit and 24-bit, a second save of the same samples, and the length-pad branch. A denoise that omits `write_file` still writes that file.
+- [x] A denoise from the window leaves no WAV until Save is used. The same test calls the worker with `write_file` false and the output folder stays empty. Saving over the opened file is refused and does not change that file. A failed write removes the partial.
+- [x] Manual still matches 1.1.0 (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match except the TTS file, which is 16-bit here and was 24-bit in 1.1 (max abs diff about 4.5e-5). The four released scenes, Dialogue Off, match frozen 1.2.0: 16 of 16, buffer and file. `verify_core.py` exit 0, same figures as 1.4.0. Hazel smoke: 16.9 s for 17.9 s, 6 of 8 marker words, `kit` heard as `kick`.
+- [x] `CHANGELOG.md` has a 1.5.0 entry, and the commit, `v1.5.0` tag and GitHub Release are published. Window remeasured: requested 721×1020. At 860×996 the waveform is 130 px; at 995 px it is 129. At 760×996 the action row and the selection row each stay on one line. Minimum size stays 760×996.
 
 ## Later
 
@@ -150,7 +150,7 @@ Candidates, not yet agreed:
 
 - Voicing (`estimate_voicing`) runs twice per chunk on Heavy Wind and Highway, once on the dry chunk and once on the network's output, at about 0.77 s a call. It is now the largest cost after DeepFilterNet itself, about a quarter of a Heavy Wind render.
 - On Pedestrian Street the floor gate needs its own voicing pass, which makes Street renders about 40 % slower than in 1.1. Reusing the voicing measured before the model would roughly halve that, at some cost in how well quiet harmonics are protected.
-- After `denoise()` returns, Cancel is no longer checked, so a Cancel pressed while the file is being written still saves it; and a failed write leaves a `.partial.wav` behind.
+- Denoise no longer writes a file, so Cancel during Denoise cannot leave a WAV. Save denoised… is the write you just asked for, so Cancel stays disabled during it; a failed save removes its `.partial.wav`. Save selection already removes its own partial.
 
 Further work will be added here once agreed with Mark.
 

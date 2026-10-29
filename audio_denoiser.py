@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.4
+Audio DeNoiser 1.5
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -37,8 +37,9 @@ How the processing chain works
    Wind, Highway, Street and Conversation lower the steady residual floor (the
    floor gate). Conversation, and any scene whose Dialogue control is above Off,
    then lifts the consonant band on voiced frames and on consonants beside a vowel.
-4. Resample back to the source rate, optionally peak-normalise, and save a WAV
-   named <name>_denoised.wav at the source's bit depth (24-bit for MP3 and OGG).
+4. The denoised audio stays in the session. Save denoised… resamples it back to
+   the source rate, optionally peak-normalises, and writes a WAV at the source's
+   bit depth (24-bit for MP3 and OGG). Denoise itself does not write that file.
 5. A/B playback can be loudness-matched (ITU-R BS.1770-4). The file is untouched.
    Shift-drag on the waveform marks a range: loop it, drop it from this session
    (the file on disk stays), or save that range on its own. Read speech transcribes
@@ -78,7 +79,7 @@ from scipy import fft as sp_fft
 from scipy.signal import (butter, get_window, resample_poly, sosfilt, sosfilt_zi,
                           sosfiltfilt, stft)
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 try:
@@ -93,7 +94,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -1833,6 +1834,50 @@ def write_wav(path: Path, audio: np.ndarray, sr: int, subtype: str) -> None:
             handle.write(piece.astype(np.int16))
 
 
+def export_denoised(den48: np.ndarray, opts: dict) -> dict:
+    """Write den48 at the source rate. Does not modify den48.
+
+    Same resample, length match and optional peak normalisation the worker
+    used when Denoise wrote the file itself. 16-bit dither stays inside
+    write_wav, so a repeated save of the same samples matches byte for byte.
+    """
+    if den48.ndim != 2 or den48.shape[1] == 0:
+        raise ValueError("There is no denoised audio to save.")
+    if not np.isfinite(den48).all():
+        raise ValueError("The denoised audio contains invalid samples.")
+    dest = Path(opts["dest"])
+    src = Path(opts["src_path"])
+    if dest.resolve() == src.resolve():
+        raise ValueError("That is the file you opened. Choose a different name.")
+    out = resample(den48, MODEL_SR, opts["src_sr"])
+    # Resampling can be a sample out either way; match the source length exactly.
+    n_src = opts["src_frames"]
+    if out.shape[1] >= n_src:
+        out = out[:, :n_src]
+    else:
+        out = np.pad(out, ((0, 0), (0, n_src - out.shape[1])))
+    gain_db = None
+    if opts.get("normalise"):
+        out, gain_db = peak_normalise(out, NORMALISE_PEAK_DBFS)
+    clipped = bool(out.size) and float(np.max(np.abs(out))) > 1.0
+    out = np.clip(out, -1.0, 1.0)
+    subtype = opts.get("subtype", "PCM_24")
+    if subtype not in EXPORT_SUBTYPES:
+        subtype = "PCM_24"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(".partial.wav")
+    try:
+        write_wav(partial, out, opts["src_sr"], subtype)
+        os.replace(partial, dest)
+    except Exception:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return {"path": str(dest), "gain_db": gain_db, "clipped": clipped, "subtype": subtype}
+
+
 def load_model():
     """Import torch/DeepFilterNet lazily (slow) and load the DFN3 model."""
     import torch
@@ -2643,7 +2688,11 @@ class AudioDeNoiserApp(ctk.CTk):
         self.original_lufs = float("-inf")
         self.denoised_lufs = float("-inf")
         self.denoised_peak = 0.0
-        self.busy: str | None = None  # None, "load", "denoise", "captions" or "selection"
+        self.busy: str | None = None  # None, "load", "denoise", "captions", "selection" or "save"
+        self._export_dirty = False
+        self._after_save: str | None = None  # "close", "open" or "denoise" once a save finishes
+        self._pending_open: str | None = None
+        self._discard_export = False
         self._last_time_text = ""
         self._pending_file = initial_file
         self._selection: tuple[int, int] | None = None
@@ -2848,7 +2897,7 @@ class AudioDeNoiserApp(ctk.CTk):
         self.normalise_switch = ctk.CTkSwitch(switches, text="Normalise saved file to −1 dBFS",
                                               variable=self.normalise_var, font=self._font(13),
                                               text_color=C_TEXT, progress_color=C_AMBER,
-                                              command=self._save_settings)
+                                              command=self._on_normalise_toggle)
         self.normalise_switch.grid(row=0, column=1, sticky="w")
         self.subtitles_var = ctk.BooleanVar(value=bool(self.settings.get("subtitles", False)))
         self.subtitles_switch = ctk.CTkSwitch(
@@ -2877,13 +2926,18 @@ class AudioDeNoiserApp(ctk.CTk):
                                          fg_color=C_AMBER, hover_color=C_AMBER_HOVER,
                                          text_color=C_ON_AMBER, text_color_disabled="#6B5F4D")
         self.denoise_btn.grid(row=0, column=0, sticky="ew")
+        self.save_wav_btn = ctk.CTkButton(action, text="Save denoised…", command=self.save_denoised,
+                                          width=150, height=44, font=self._font(14),
+                                          fg_color=C_LINE, hover_color=C_LINE_HOVER,
+                                          text_color=C_TEXT, text_color_disabled=C_MUTED)
+        self.save_wav_btn.grid(row=0, column=1, padx=(8, 0))
         self.cancel_btn = ctk.CTkButton(action, text="Cancel", command=self.cancel_denoise,
                                         width=100, height=44, font=self._font(14),
                                         fg_color=C_DANGER, hover_color=C_DANGER_HOVER,
                                         text_color=C_TEXT, text_color_disabled=C_MUTED)
-        self.cancel_btn.grid(row=0, column=1, padx=(8, 0))
+        self.cancel_btn.grid(row=0, column=2, padx=(8, 0))
         progress_row = ctk.CTkFrame(action, fg_color="transparent")
-        progress_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        progress_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         progress_row.grid_columnconfigure(0, weight=1)
         self.progress = ctk.CTkProgressBar(progress_row, mode="determinate", height=8,
                                            progress_color=C_AMBER, fg_color=C_LINE)
@@ -2986,6 +3040,12 @@ class AudioDeNoiserApp(ctk.CTk):
         self.settings.update(data)
         save_settings(self.settings)
 
+    def _on_normalise_toggle(self) -> None:
+        """The switch is read when the file is written, so a change makes that file stale."""
+        self._save_settings()
+        if self.denoised48 is not None:
+            self._export_dirty = True
+
     def _on_loudness_toggle(self) -> None:
         self._save_settings()
         if self.player.has("denoised"):
@@ -3037,6 +3097,7 @@ class AudioDeNoiserApp(ctk.CTk):
         on = lambda flag: "normal" if flag else "disabled"
         self.open_btn.configure(state=on(idle))
         self.denoise_btn.configure(state=on(idle and has_file and self.model is not None))
+        self.save_wav_btn.configure(state=on(idle and self.denoised48 is not None))
         cancellable = self.busy in ("denoise", "captions")
         self.cancel_btn.configure(state=on(cancellable),
                                   fg_color=C_DANGER if cancellable else C_LINE)
@@ -3220,6 +3281,7 @@ class AudioDeNoiserApp(ctk.CTk):
             "output_path": self.output_path,
             "source": source,
             "loop_on": self._loop_on,
+            "export_dirty": self._export_dirty,
         }
         self.audio48 = new_audio
         self.denoised48 = new_den
@@ -3227,6 +3289,8 @@ class AudioDeNoiserApp(ctk.CTk):
         self._cue_text = ""
         self.subtitle_label.configure(text="")
         self.output_path = None
+        if new_den is not None:
+            self._export_dirty = True
         if self.source_sr:
             self.source_frames = resampled_length(new_audio.shape[1], MODEL_SR, self.source_sr)
         self._selection = None
@@ -3255,6 +3319,7 @@ class AudioDeNoiserApp(ctk.CTk):
         self.denoised_lufs = snap["denoised_lufs"]
         self.denoised_peak = snap["denoised_peak"]
         self.output_path = snap["output_path"]
+        self._export_dirty = bool(snap.get("export_dirty", False))
         self._loop_on = bool(snap.get("loop_on")) and self._selection is not None
         self._reload_session(int(snap["playhead"]), str(snap.get("source", "original")))
         self.log("Restored the removed section.")
@@ -3355,16 +3420,28 @@ class AudioDeNoiserApp(ctk.CTk):
     def open_file(self, path: str | None = None) -> None:
         if self.busy:
             return
+        if self._export_dirty and self.denoised48 is not None:
+            self._pending_open = path
+            self._confirm_discard("open")
+            return
+        self._begin_open(path)
+
+    def _begin_open(self, path: str | None) -> None:
         if not path:
             path = filedialog.askopenfilename(
                 title="Open audio",
                 initialdir=self.settings.get("last_dir") or str(Path.home()),
                 filetypes=[("Audio files", "*.wav *.mp3 *.flac *.ogg"), ("All files", "*.*")])
         if not path:
+            self._discard_export = False
             return
         if not os.path.isfile(path):
             self.log(f"File not found: {path}")
+            self._discard_export = False
             return
+        if self._discard_export:
+            self._export_dirty = False
+            self._discard_export = False
         self.settings["last_dir"] = str(Path(path).parent)
         self._save_settings()
         self.player.stop()
@@ -3372,6 +3449,17 @@ class AudioDeNoiserApp(ctk.CTk):
         self._run_job("load", self._job_load_file, path)
 
     def start_denoise(self) -> None:
+        if self.busy or self.audio48 is None or self.model is None:
+            return
+        if self._export_dirty and self.denoised48 is not None:
+            self._confirm_discard("denoise")
+            return
+        self._begin_denoise()
+
+    def _begin_denoise(self) -> None:
+        if self._discard_export:
+            self._export_dirty = False
+            self._discard_export = False
         if self.busy or self.audio48 is None or self.model is None:
             return
         self.player.pause()
@@ -3388,11 +3476,88 @@ class AudioDeNoiserApp(ctk.CTk):
             "subtype": self.source_subtype or "PCM_24",
             "lift_db": LIFT_CHOICES.get(self.lift_var.get(), 0.0),
             "subtitles": bool(self.subtitles_var.get()),
+            "write_file": False,
         }
         self.cancel_event.clear()
         self.progress.set(0)
         self.progress_label.configure(text="0%")
         self._run_job("denoise", self._job_denoise, self.audio48, self.model, self.df_state, opts)
+
+    def save_denoised(self, then: str | None = None) -> None:
+        """Ask for a path and write the denoised session. then is close, open or denoise."""
+        if self.busy or self.denoised48 is None or self.source_path is None or not self.source_sr:
+            return
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.log(f"Couldn't use the Save to folder: {exc}")
+            return
+        initial = f"{Path(self.source_path).stem}_denoised.wav"
+        chosen = filedialog.asksaveasfilename(
+            title="Save denoised audio",
+            initialdir=str(self.output_dir),
+            initialfile=initial,
+            defaultextension=".wav",
+            filetypes=[("WAV audio", "*.wav")])
+        if not chosen:
+            self._after_save = None
+            return
+        if Path(chosen).resolve() == Path(self.source_path).resolve():
+            self.log("That is the file you opened. Choose a different name.")
+            self._after_save = None
+            return
+        self._after_save = then
+        opts = {
+            "dest": chosen,
+            "src_path": self.source_path,
+            "src_sr": self.source_sr,
+            "src_frames": self.source_frames,
+            "normalise": bool(self.normalise_var.get()),
+            "subtype": self.source_subtype or "PCM_24",
+        }
+        self.progress.set(0)
+        self.progress_label.configure(text="")
+        self._run_job("save", self._job_save, self.denoised48, opts)
+
+    def _job_save(self, den48: np.ndarray, opts: dict) -> None:
+        saved = export_denoised(den48, opts)
+        self.events.put(("save_done", saved))
+
+    def _confirm_discard(self, then: str) -> None:
+        """Save, drop, or keep an unsaved denoise before close, open, or another denoise."""
+        if not self._export_dirty or self.denoised48 is None:
+            self._follow(then)
+            return
+        answer = messagebox.askyesnocancel(
+            "Audio DeNoiser",
+            "The denoised audio has not been saved. Save it before continuing?",
+            parent=self)
+        if answer is None:
+            self._pending_open = None
+            return
+        if answer:
+            self.save_denoised(then=then)
+            return
+        # Dropping the pass waits until the next action really starts. Cancelling
+        # the open dialog after No must still ask on the next close.
+        self._discard_export = True
+        self._follow(then)
+
+    def _follow(self, then: str) -> None:
+        if then == "close":
+            self._finish_close()
+        elif then == "open":
+            path = self._pending_open
+            self._pending_open = None
+            self._begin_open(path)
+        elif then == "denoise":
+            self._begin_denoise()
+
+    def _finish_close(self) -> None:
+        self.cancel_event.set()
+        self.player.stop()
+        self._save_settings()
+        self.destroy()
 
     def cancel_denoise(self) -> None:
         if self.busy in ("denoise", "captions"):
@@ -3447,10 +3612,17 @@ class AudioDeNoiserApp(ctk.CTk):
             self.log(f"Couldn't open the folder: {exc}")
 
     def _on_close(self) -> None:
-        self.cancel_event.set()
-        self.player.stop()
-        self._save_settings()
-        self.destroy()
+        if self.busy == "save":
+            self._after_save = "close"
+            self.log("The file is still being saved. The window will close when that finishes.")
+            return
+        if self.busy:
+            self.cancel_event.set()
+            self.player.stop()
+            self._save_settings()
+            self.destroy()
+            return
+        self._confirm_discard("close")
 
     # ------------------------------------------------------------- worker --
     def _run_job(self, stage: str, job, *args) -> None:
@@ -3532,33 +3704,26 @@ class AudioDeNoiserApp(ctk.CTk):
         lufs = integrated_loudness(den48, MODEL_SR)
         peak = float(np.max(np.abs(den48))) if den48.size else 0.0
 
-        out = resample(den48, MODEL_SR, opts["src_sr"])
-        # Resampling can be a sample out either way; match the source length exactly.
-        n_src = opts["src_frames"]
-        if out.shape[1] >= n_src:
-            out = out[:, :n_src]
-        else:
-            out = np.pad(out, ((0, 0), (0, n_src - out.shape[1])))
-        gain_db = None
-        if opts["normalise"]:
-            out, gain_db = peak_normalise(out, NORMALISE_PEAK_DBFS)
-        clipped = float(np.max(np.abs(out))) > 1.0
-        out = np.clip(out, -1.0, 1.0)
-
-        out_dir = Path(opts["out_dir"])
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{Path(opts['src_path']).stem}_denoised.wav"
-        tmp_path = out_dir / f"{out_path.stem}.partial.wav"
         subtype = opts.get("subtype", "PCM_24")
         if subtype not in EXPORT_SUBTYPES:
             subtype = "PCM_24"
-        write_wav(tmp_path, out, opts["src_sr"], subtype)
-        os.replace(tmp_path, out_path)
+        if opts.get("write_file", True):
+            # Parity scripts omit write_file, so they still get the file 1.4 wrote.
+            saved = export_denoised(den48, {
+                "dest": str(Path(opts["out_dir"]) / f"{Path(opts['src_path']).stem}_denoised.wav"),
+                "src_path": opts["src_path"],
+                "src_sr": opts["src_sr"],
+                "src_frames": opts["src_frames"],
+                "normalise": opts["normalise"],
+                "subtype": subtype,
+            })
+        else:
+            saved = {"path": None, "gain_db": None, "clipped": False, "subtype": subtype}
 
-        put(("denoise_done", {"path": str(out_path), "den48": den48,
+        put(("denoise_done", {"path": saved["path"], "den48": den48,
                               "env": waveform_envelope(den48), "elapsed": elapsed,
-                              "gain_db": gain_db, "clipped": clipped,
-                              "lufs": lufs, "peak": peak, "subtype": subtype,
+                              "gain_db": saved["gain_db"], "clipped": saved["clipped"],
+                              "lufs": lufs, "peak": peak, "subtype": saved["subtype"],
                               "guard": preset.transient_guard, "stats": stats,
                               "subtitles": bool(opts.get("subtitles", False))}))
 
@@ -3633,9 +3798,11 @@ class AudioDeNoiserApp(ctk.CTk):
         except queue.Empty:
             pass
         finally:
-            self.player.tick()
-            self._update_transport()
-            self.after(self.POLL_MS, self._poll)
+            # A save can close the window from this same turn. Do not touch it afterwards.
+            if self.winfo_exists():
+                self.player.tick()
+                self._update_transport()
+                self.after(self.POLL_MS, self._poll)
 
     def _on_log(self, message: str) -> None:
         self.log(message)
@@ -3656,6 +3823,10 @@ class AudioDeNoiserApp(ctk.CTk):
         self._loop_on = False
         self._undo = None
         self.output_path = None
+        self._export_dirty = False
+        self._after_save = None
+        self._pending_open = None
+        self._discard_export = False
         self.source_subtype = info["subtype"]
         self.original_lufs = info["lufs"]
         self.denoised_lufs = float("-inf")
@@ -3692,6 +3863,7 @@ class AudioDeNoiserApp(ctk.CTk):
     def _on_denoise_done(self, info: dict) -> None:
         self.busy = None
         self.output_path = info["path"]
+        self._export_dirty = not info["path"]
         self.denoised48 = info["den48"]
         self.denoised_lufs = info["lufs"]
         self.denoised_peak = info["peak"]
@@ -3709,12 +3881,15 @@ class AudioDeNoiserApp(ctk.CTk):
                          f"and {pops} pop{'s' if pops != 1 else ''}.")
             else:
                 self.log("Transient guard found no isolated clicks or pops to repair.")
-        if info["gain_db"] is not None:
-            self.log(f"Normalised to {NORMALISE_PEAK_DBFS:g} dBFS ({info['gain_db']:+.1f} dB).")
-        if info["clipped"]:
-            self.log("Some peaks went over full scale and were clipped. "
-                     "Turn on normalising to avoid this.")
-        self.log(f"Saved {self.output_path} ({DEPTH_LABELS[info['subtype']]} WAV).")
+        if info["path"]:
+            if info["gain_db"] is not None:
+                self.log(f"Normalised to {NORMALISE_PEAK_DBFS:g} dBFS ({info['gain_db']:+.1f} dB).")
+            if info["clipped"]:
+                self.log("Some peaks went over full scale and were clipped. "
+                         "Turn on normalising to avoid this.")
+            self.log(f"Saved {self.output_path} ({DEPTH_LABELS[info['subtype']]} WAV).")
+        else:
+            self.log("Denoise finished. Press Save denoised to write the WAV.")
         self._apply_playback_gains(announce=True)
         self.log("Press B to hear the denoised version, A for the original.")
         self._cues = []
@@ -3723,9 +3898,28 @@ class AudioDeNoiserApp(ctk.CTk):
             self.log("English transcript of the denoised audio. A read-speech model: "
                      "names and street noise will be misspelt.")
             self._caption_warned = True
-            self._run_job("captions", self._job_captions, info["den48"], info["path"])
+            self._run_job("captions", self._job_captions, info["den48"], info["path"] or "")
         else:
             self._refresh_controls()
+
+    def _on_save_done(self, info: dict) -> None:
+        self.busy = None
+        self.output_path = info["path"]
+        self._export_dirty = False
+        self.progress.set(1.0)
+        self.progress_label.configure(text="")
+        depth = DEPTH_LABELS.get(info.get("subtype"), "WAV")
+        self.log(f"Saved {info['path']} ({depth} WAV).")
+        if info.get("gain_db") is not None:
+            self.log(f"Normalised to {NORMALISE_PEAK_DBFS:g} dBFS ({info['gain_db']:+.1f} dB).")
+        if info.get("clipped"):
+            self.log("Some peaks went over full scale and were clipped. "
+                     "Turn on normalising to avoid this.")
+        follow = self._after_save
+        self._after_save = None
+        self._refresh_controls()
+        if follow:
+            self._follow(follow)
 
     def _on_cancelled(self, _payload) -> None:
         self.busy = None
@@ -3742,6 +3936,9 @@ class AudioDeNoiserApp(ctk.CTk):
             self.busy = None
             self.progress.set(0)
             self.progress_label.configure(text="")
+        if stage == "save":
+            # The pass is still unsaved, and a close or open waiting on this write stops.
+            self._after_save = None
         self.log(f"Error: {message}")
         self._refresh_controls()
 

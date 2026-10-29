@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.4.0-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.5.0-F2A93B)
 
 </div>
 
@@ -27,7 +27,8 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 | --- | --- |
 | Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
 | Dialogue lift | Off, Gentle or Clear. Raises consonants a few metres away after the model. Off, the default everywhere except Conversation, leaves the audio untouched |
-| Subtitles | Optional English transcript. Read speech transcribes the buffer you are hearing, without denoising first. The switch transcribes the denoised audio after Denoise. Words follow the playhead, and Save text writes an SRT and a plain transcript |
+| Subtitles | Optional English transcript. Read speech transcribes the buffer you are hearing, without denoising first. The switch transcribes the denoised audio after Denoise, without waiting for a WAV. Words follow the playhead, and Save text writes an SRT and a plain transcript |
+| Save denoised | Denoise keeps the result in memory. Save denoised… writes the WAV when you ask, at the source rate and bit depth. Closing, opening another file, or denoising again asks before an unsaved pass is dropped |
 | Waveform range | Shift-drag marks a stretch of the waveform. Loop plays it until Stop. Cut removes it from this session only. Save selection writes that stretch on its own, at the source rate and bit depth |
 | Transient guard | Heavy Wind and Highway repair isolated clicks, ticks and knocks (autoregressive interpolation) and low pops in pauses before the model, which otherwise passes them. Consonant bursts are left alone |
 | Floor gate | Heavy Wind, Highway and Pedestrian Street lower the steady wash the model leaves under its blend limit, by up to 10, 12 or 8 dB, with voiced harmonics protected |
@@ -35,7 +36,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 | Adjustable noise reduction | Attenuation limit from 6 dB up to maximum, so you can keep some natural ambience |
 | Instant A/B comparison | Switch between original and denoised audio mid-playback with a single key. Optionally loudness-matched (ITU-R BS.1770-4) for playback only |
 | Chunked processing | 30 s segments with a 2 s pre-roll and 0.25 s crossfades, giving a real progress bar, a working Cancel button and flat memory use on long recordings |
-| Mastering-ready output | Optional peak normalisation to -1.0 dBFS. WAV output at the source's bit depth (16, 24 or 32-bit PCM, or float); 16-bit is rounded with TPDF dither. MP3 and OGG sources are saved as 24-bit |
+| Mastering-ready output | Optional peak normalisation to -1.0 dBFS, applied when you save. WAV output at the source's bit depth (16, 24 or 32-bit PCM, or float); 16-bit is rounded with TPDF dither. MP3 and OGG sources are saved as 24-bit |
 | Broad input support | WAV, MP3, FLAC and OGG |
 | Distinctive interface | CustomTkinter UI styled in streetlight amber on wet asphalt |
 
@@ -44,7 +45,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 1. Decode WAV, MP3, FLAC or OGG with `soundfile` and resample to 48 kHz.
 2. **Manual** is the 1.0 chain: optionally high-pass filter to remove wind and traffic rumble below 60 to 120 Hz, then hand the audio to the model. A **named scene** does not use that switch. Inside each chunk, Heavy Wind and Highway first repair isolated clicks and low pops (the transient guard). Every named scene then runs an infrasonic filter, ducks gust energy under the scene's split while the fragment is unvoiced, and pulls down a steady idle tone or a confirmed 50/100 Hz hum.
 3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway, Pedestrian Street and Conversation lower the steady residual floor (the floor gate). If Dialogue is Gentle or Clear, the consonant band is then lifted. All of that happens before the crossfade.
-4. Resample back to the source rate, optionally peak-normalise, and save a WAV named `<name>_denoised.wav` in the output folder, at the source's bit depth (24-bit for MP3 and OGG).
+4. The denoised audio stays in the session. **Save denoised…** resamples it back to the source rate, optionally peak-normalises, and writes a WAV at the source's bit depth (24-bit for MP3 and OGG). The suggested name is `<name>_denoised.wav` in the Save to folder. Denoise itself does not write that file.
 5. For A/B playback, the integrated loudness of both versions is measured (ITU-R BS.1770-4) and, if **Match A/B loudness** is on, the denoised copy plays at the original's loudness. The saved file is never touched by this.
 6. Shift-drag on the waveform marks a range. Loop repeats it, Cut drops it from the session (the file on disk stays as it was), and Save selection writes that range alone. Read speech transcribes whichever buffer you are hearing.
 
@@ -120,7 +121,7 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
 
 | Key | Meaning |
 | --- | --- |
-| `output_dir` | Where denoised files are saved. Falls back to `Music\Denoised` if unavailable |
+| `output_dir` | The folder Save denoised… opens in. Choosing another folder in the save dialog does not change this. Falls back to `Music\Denoised` if unavailable |
 | `atten_index` | Noise-reduction strength, 0 to 9, where 9 is maximum |
 | `highpass` | Rumble filter: `Off`, `60 Hz`, `80 Hz`, `100 Hz` or `120 Hz`. Forced to `Off` while a named scene is selected |
 | `post_filter` | DeepFilterNet's extra post-filter for heavy noise |
@@ -129,7 +130,7 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
 | `last_dir` | Last folder a file was opened from |
 | `scene` | `manual`, `wind`, `traffic`, `street`, `conversation` or `podcast`. Missing or unknown means Manual |
 | `dialogue_lift` | `off`, `gentle` or `clear`. Missing means the scene's own default (Clear on Conversation, Off on the others) |
-| `subtitles` | After Denoise, transcribe the denoised audio and show the words during playback. Missing means off. Read speech is a button, not a saved setting |
+| `subtitles` | After Denoise, transcribe the denoised audio and show the words during playback. It does not wait for the WAV to be saved. Missing means off. Read speech is a button, not a saved setting |
 | `manual_highpass` | Rumble choice remembered while a named scene is in use. Default `80 Hz` |
 | `manual_atten_index` | Slider position remembered for the return to Manual. Default `9` (maximum) |
 | `manual_post_filter` | Post-filter switch remembered for the return to Manual. Default `false` |
@@ -153,7 +154,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
-| 1.5.0 | Planned | Save the denoised audio when you ask, instead of writing the WAV as soon as Denoise finishes. See [`ROADMAP.md`](ROADMAP.md) |
+| [1.5.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.5.0) | 29 October 2026 | Save denoised… writes the WAV when you ask. Denoise keeps the result in memory. The denoiser is unchanged |
 | [1.4.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.4.0) | 29 October 2026 | Mark a waveform range to loop it, cut it from the session, or save it on its own. Read speech transcribes the buffer you are hearing. The denoiser is unchanged |
 | [1.3.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.3.0) | 28 October 2026 | Conversation (1–5 m), a dialogue lift for talk a few metres away, and optional playback subtitles. Dialogue Off keeps the 1.2.1 sound |
 | [1.2.1](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.1) | 28 October 2026 | Heavy Wind & Gusts and Highway / Traffic Drone render 11-23 % faster; output byte-identical to 1.2.0 |
