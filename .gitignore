@@ -61,3 +61,6 @@ $RECYCLE.BIN/
 # --- Local-only design notes and project memory --------------------------
 notes/
 CLAUDE.md
+.grok/
+role.md
+GROK_ACCESS.txt
