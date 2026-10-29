@@ -15,6 +15,8 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | 1.3.0 | Dialogue lift, Conversation (1–5 m), playback subtitles | Released 28 October 2026. Listening check passed 29 October 2026: works well on a real 1–5 metre take |
 | 1.4.0 | Waveform range: loop, cut from the session, save the range, read speech | Released 29 October 2026. The denoiser is unchanged |
 | 1.5.0 | Save the denoised audio when asked | Released 29 October 2026. The denoiser is unchanged |
+| 1.6.0 | Named presets in the scene list | Released 29 October 2026. The denoiser is unchanged |
+| 1.7.0 | Voice clarity on voiced frames | Scheduled 29 October 2026. Not started. A measurement of one file, not a listening pass |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -143,6 +145,54 @@ Done when:
 - [x] A denoise from the window leaves no WAV until Save is used. The same test calls the worker with `write_file` false and the output folder stays empty. Saving over the opened file is refused and does not change that file. A failed write removes the partial.
 - [x] Manual still matches 1.1.0 (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match except the TTS file, which is 16-bit here and was 24-bit in 1.1 (max abs diff about 4.5e-5). The four released scenes, Dialogue Off, match frozen 1.2.0: 16 of 16, buffer and file. `verify_core.py` exit 0, same figures as 1.4.0. Hazel smoke: 16.9 s for 17.9 s, 6 of 8 marker words, `kit` heard as `kick`.
 - [x] `CHANGELOG.md` has a 1.5.0 entry, and the commit, `v1.5.0` tag and GitHub Release are published. Window remeasured: requested 721×1020. At 860×996 the waveform is 130 px; at 995 px it is 129. At 760×996 the action row and the selection row each stay on one line. Minimum size stays 760×996.
+
+## 1.6.0 - Named presets (released 29 October 2026)
+
+Design note: `notes/01_Active/008_user_presets_and_speech_crispness.md` (local only). Mark's go-ahead to release the presets was 29 October 2026. The consonant restore is not in this version. He scheduled it as 1.7.0.
+
+Scope:
+
+- **Save preset…** stores the controls on screen under a name and lists that name under the six factory scenes. Delete removes the name. Factory scenes are not deleted, and choosing one still applies that scene's own defaults.
+- The record is the scene, dialogue, noise-reduction step, rumble choice, post-filter and normalise. It lives in `settings.json` under `user_presets`. Loading applies the scene, then writes the stored controls back, so a saved tweak is kept. A named scene still forces the rumble filter off.
+- `denoise()`, `apply_scene`, `apply_dialogue_lift` and `write_wav` stay as they are. Manual, and Dialogue Off on the released scenes, stay bit-identical to 1.5.0. Nothing new is installed.
+
+Done when:
+
+- [x] Named presets round-trip through `settings.json`. A factory scene still applies its own defaults. Loading a saved Conversation tweak keeps that step, and a named scene leaves the rumble filter off. `notes/tests/presets_160.py`, 29 October 2026, fails 0.
+- [x] Manual still matches 1.1.0 (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match except the TTS file, which is 16-bit here and was 24-bit in 1.1 (max abs diff about 4.5e-5).
+- [x] The window is measured with Save preset… and Delete on the scene row. Requested size stays 721×1026. At 860×1020 the waveform is 148 px and the log is on screen. The smallest height is 1002: the waveform is 130 px there and 129 px at 1001. At 760×1002 the scene row stays on one line and Delete stays inside the window. Default size stays 860×1020.
+- [x] `CHANGELOG.md` has a 1.6.0 entry, and the commit, `v1.6.0` tag and GitHub Release are published.
+
+## 1.7.0 - Voice clarity on voiced frames (scheduled, not started)
+
+Design note: `notes/01_Active/008_user_presets_and_speech_crispness.md`, section 4.2 (local only). Mark scheduled this on 29 October 2026, when he released 1.6.0. It is not in 1.6.0. Named presets do not change a single sample, so Conversation still darkens the consonants on the measured file.
+
+The table is a measurement of one file, `D:\Audio\01.wav` against `D:\Audio\Denoised\01_denoised.wav`. It is not a listening pass. That file is the 7:11 helmet-mic cycling take. It is not the walking take, and it is not the separate five-metre take. Do not retune Conversation's attenuation or the Clear cap from this file alone. The Clear lift stands aside here because the voice is already much brighter than the frozen −23 dB close-speech target.
+
+Every preview of this work reports voiced frames in this shape. Voicing is the app's own detector. "Change" is denoised minus original. "Against the vowel" subtracts the vowel-body change, so peak-normalise cannot look like a filter.
+
+| Band | Change | Against the vowel |
+| --- | --- | --- |
+| 20–80 Hz | −21.6 dB | −14.8 dB |
+| 80–200 Hz | −15.7 dB | −8.9 dB |
+| 300 Hz–1 kHz, the vowel | −6.8 dB | — |
+| 1.8–4 kHz, presence | −11.1 dB | −4.3 dB |
+| 4–6.5 kHz, consonants | −14.2 dB | −7.4 dB |
+
+The gaps to close, relative to the vowel, are 4.3 dB in presence and 7.4 dB in the consonant band. Those numbers describe this file. They are not new frozen constants. The neighbouring bands measured in the same pass stay in the local note.
+
+Scope:
+
+- A consonant restore after the dialogue lift. Default off. On voiced frames only, restore part of a presence or consonant band that the processing made darker than the dry balance against the vowel. Never brighter than the dry frame. Never on unvoiced frames, so wind and hiss stay down.
+- A preview of this pair, stage on and stage off, reported in the table above, before the stage can be a default. Factory scenes stay bit-identical while it is off.
+- `denoise()` is touched only when this stage is actually built.
+
+Done when:
+
+- [ ] The stage is built, off by default, and a preview of this pair is rendered with it on and off.
+- [ ] Mark has listened to that preview. The table is filled again for both passes. This measurement is not that listening check.
+- [ ] Manual, and Dialogue Off on the scenes shipped in 1.6.0, stay bit-identical while the stage is off.
+- [ ] `CHANGELOG.md` has a dated 1.7.0 entry, and the commit, tag and GitHub Release are published. Not until Mark says proceed.
 
 ## Later
 

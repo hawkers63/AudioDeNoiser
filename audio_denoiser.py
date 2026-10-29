@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.5
+Audio DeNoiser 1.6
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -79,7 +79,7 @@ from scipy import fft as sp_fft
 from scipy.signal import (butter, get_window, resample_poly, sosfilt, sosfilt_zi,
                           sosfiltfilt, stft)
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 
 try:
@@ -94,7 +94,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -1715,6 +1715,80 @@ SCENES: dict[str, ScenePreset] = {
 SCENE_ORDER = ("manual", "wind", "traffic", "street", "conversation", "podcast")
 SCENE_BY_LABEL = {preset.label: preset for preset in SCENES.values()}
 
+# Named presets are control snapshots in the scene menu. They are not a DSP path.
+PRESET_NAME_LIMIT = 40
+PRESET_COUNT_LIMIT = 20
+
+
+def dialogue_menu_label(key: str) -> str:
+    """Menu text for a stored dialogue key (off, gentle, clear)."""
+    return {"off": "Off", "gentle": "Gentle", "clear": "Clear"}.get(key, "Off")
+
+
+def _preset_record(item: object) -> dict[str, object] | None:
+    """One stored preset, or None when the entry cannot be applied safely."""
+    if not isinstance(item, dict):
+        return None
+    name = item.get("name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if (not name or len(name) > PRESET_NAME_LIMIT or name in SCENE_BY_LABEL
+            or any(ord(ch) < 32 for ch in name)):
+        return None
+    scene = item.get("scene")
+    if not isinstance(scene, str) or scene not in SCENES:
+        return None
+    lift = str(item.get("dialogue_lift", "")).lower()
+    if lift not in ("off", "gentle", "clear"):
+        return None
+    index = item.get("atten_index")
+    # bool is an int subclass, and it is not a slider step.
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    if index < 0 or index >= len(ATTEN_STEPS):
+        return None
+    highpass = item.get("highpass")
+    if not isinstance(highpass, str) or highpass not in HIGHPASS_CHOICES:
+        return None
+    post_filter = item.get("post_filter")
+    normalise = item.get("normalise")
+    if type(post_filter) is not bool or type(normalise) is not bool:
+        return None
+    return {
+        "name": name,
+        "scene": scene,
+        "dialogue_lift": lift,
+        "atten_index": index,
+        "highpass": highpass,
+        "post_filter": post_filter,
+        "normalise": normalise,
+    }
+
+
+def clean_user_presets(raw: object) -> list[dict[str, object]]:
+    """Drop broken records, factory-label collisions and duplicate names.
+
+    A missing list becomes empty, so a settings file from 1.5.0 still loads.
+    Factory labels are matched with their case intact.
+    """
+    if not isinstance(raw, list):
+        return []
+    kept: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in raw:
+        record = _preset_record(item)
+        if record is None:
+            continue
+        name = str(record["name"])
+        if name in seen:
+            continue
+        seen.add(name)
+        kept.append(record)
+        if len(kept) >= PRESET_COUNT_LIMIT:
+            break
+    return kept
+
 
 def peak_normalise(audio: np.ndarray, peak_dbfs: float) -> tuple[np.ndarray, float]:
     """Scale so the loudest sample sits at peak_dbfs. Returns (audio, gain_db)."""
@@ -2664,12 +2738,20 @@ class AudioDeNoiserApp(ctk.CTk):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("860x1020")
-        self.minsize(760, 996)  # measured: any shorter and the waveform drops below 130 px
+        # Measured with Save preset… on the scene row: the waveform is 129 px at
+        # 1001 and 130 px at 1002. The default 1020 still shows the log.
+        self.minsize(760, 1002)
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
         saved_scene = self.settings.get("scene", "manual")
         self._applied_scene = saved_scene if saved_scene in SCENES else "manual"
+        self._user_presets = clean_user_presets(self.settings.get("user_presets"))
+        self._applying_preset = False
+        wanted = self.settings.get("selected_preset", "")
+        self._startup_preset = ""
+        if isinstance(wanted, str) and any(item["name"] == wanted for item in self._user_presets):
+            self._startup_preset = wanted
         self.output_dir = resolve_output_dir(self.settings.get("output_dir"))
         self.events: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
@@ -2829,16 +2911,27 @@ class AudioDeNoiserApp(ctk.CTk):
         hint_opts = {"font": self._font(12), "text_color": C_MUTED, "anchor": "w"}
         row_pad = {"padx": 14, "pady": (8, 0)}
 
-        self.scene_var = ctk.StringVar(value=SCENES[self._applied_scene].label)
+        opening = self._startup_preset or SCENES[self._applied_scene].label
+        self.scene_var = ctk.StringVar(value=opening)
         ctk.CTkLabel(panel, text="Scene", **label_opts).grid(
             row=0, column=0, sticky="w", **row_pad)
+        scene_row = ctk.CTkFrame(panel, fg_color="transparent")
+        scene_row.grid(row=0, column=1, columnspan=2, sticky="ew",
+                       padx=(0, 14), pady=(8, 0))
+        scene_row.grid_columnconfigure(1, weight=1)
+        # Fixed width: a 40-character name must not push Delete off the row.
         self.scene_menu = ctk.CTkOptionMenu(
-            panel, values=[SCENES[key].label for key in SCENE_ORDER],
-            variable=self.scene_var, width=240, command=self._on_scene_change,
+            scene_row, values=self._scene_labels(), variable=self.scene_var,
+            width=240, dynamic_resizing=False, command=self._on_scene_menu,
             fg_color=C_LINE, button_color=C_LINE, button_hover_color=C_LINE_HOVER,
             text_color=C_TEXT, font=self._font(13))
-        self.scene_menu.grid(row=0, column=1, columnspan=2, sticky="w",
-                             padx=(0, 14), pady=(8, 0))
+        self.scene_menu.grid(row=0, column=0, sticky="w")
+        self.save_preset_btn = self._secondary_button(
+            scene_row, "Save preset…", self.save_preset, 128)
+        self.save_preset_btn.grid(row=0, column=2, padx=(12, 6))
+        self.delete_preset_btn = self._secondary_button(
+            scene_row, "Delete", self.delete_preset, 80)
+        self.delete_preset_btn.grid(row=0, column=3, sticky="e")
         self.scene_hint = ctk.CTkLabel(
             panel, text=SCENES[self._applied_scene].summary, wraplength=640, **hint_opts)
         self.scene_hint.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14))
@@ -2972,8 +3065,39 @@ class AudioDeNoiserApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _scene_key(self) -> str:
+        """Factory scene key. A saved preset's menu label is not a factory scene."""
+        if not hasattr(self, "scene_var"):
+            return "manual"
         preset = SCENE_BY_LABEL.get(self.scene_var.get())
-        return preset.key if preset is not None else "manual"
+        if preset is not None:
+            return preset.key
+        # The menu is showing a user preset. The scene underneath is _applied_scene.
+        # Returning "manual" here would persist the wrong scene on the next save.
+        applied = self._applied_scene
+        return applied if applied in SCENES else "manual"
+
+    def _scene_labels(self) -> list[str]:
+        labels = [SCENES[key].label for key in SCENE_ORDER]
+        labels.extend(str(item["name"]) for item in self._user_presets)
+        return labels
+
+    def _rebuild_scene_menu(self) -> None:
+        self.scene_menu.configure(values=self._scene_labels())
+
+    def _current_preset_name(self) -> str:
+        if not hasattr(self, "scene_var"):
+            return ""
+        label = self.scene_var.get()
+        for item in self._user_presets:
+            if item["name"] == label:
+                return label
+        return ""
+
+    def _find_preset(self, name: str) -> dict[str, object] | None:
+        for item in self._user_presets:
+            if item["name"] == name:
+                return item
+        return None
 
     def _remember_manual(self) -> None:
         """Keep the Manual slider, rumble choice and post-filter for the return trip."""
@@ -3014,6 +3138,168 @@ class AudioDeNoiserApp(ctk.CTk):
         self._save_settings()
         self._refresh_controls()
 
+    def _on_scene_menu(self, label: str) -> None:
+        """Factory scenes keep their old behaviour. A saved name loads that snapshot."""
+        if self._applying_preset:
+            return
+        # The dropdown sets the variable before this runs. Set it here as well,
+        # so a save during the change cannot still be looking at the previous name.
+        if self.scene_var.get() != label:
+            self.scene_var.set(label)
+        record = self._find_preset(label)
+        if record is not None:
+            self._apply_user_preset(record)
+            return
+        if label not in SCENE_BY_LABEL:
+            return
+        self._on_scene_change(label)
+
+    def _preset_name_error(self, name: str) -> str | None:
+        """None when the name can be saved. 'replace' when that name already exists."""
+        name = name.strip()
+        if not name or any(ord(ch) < 32 for ch in name):
+            return "Type a name for the preset."
+        if len(name) > PRESET_NAME_LIMIT:
+            return f"Use at most {PRESET_NAME_LIMIT} characters."
+        if name in SCENE_BY_LABEL:
+            return "That name is a built-in scene. Choose another."
+        if self._find_preset(name) is not None:
+            return "replace"
+        if len(self._user_presets) >= PRESET_COUNT_LIMIT:
+            return f"The list holds {PRESET_COUNT_LIMIT} presets. Delete one first."
+        return None
+
+    def _capture_preset(self, name: str) -> dict[str, object]:
+        scene = self._applied_scene if self._applied_scene in SCENES else "manual"
+        lift = self.lift_var.get().strip().lower()
+        if lift not in ("off", "gentle", "clear"):
+            lift = "off"
+        highpass = self.highpass_var.get()
+        if highpass not in HIGHPASS_CHOICES:
+            highpass = "Off" if SCENES[scene].active else "80 Hz"
+        return {
+            "name": name,
+            "scene": scene,
+            "dialogue_lift": lift,
+            "atten_index": self.atten_index,
+            "highpass": highpass,
+            "post_filter": bool(self.postfilter_var.get()),
+            "normalise": bool(self.normalise_var.get()),
+        }
+
+    def _commit_preset(self, name: str, *, replace: bool = False) -> str | None:
+        """Store the live controls under name. None means saved. A string is the refusal."""
+        name = name.strip()
+        error = self._preset_name_error(name)
+        if error == "replace":
+            if not replace:
+                return "replace"
+        elif error:
+            return error
+        record = self._capture_preset(name)
+        self._user_presets = [item for item in self._user_presets if item["name"] != name]
+        self._user_presets.append(record)
+        self._applying_preset = True
+        try:
+            self._rebuild_scene_menu()
+            self.scene_var.set(name)
+        finally:
+            self._applying_preset = False
+        self._save_settings()
+        self._refresh_controls()
+        self.log(f"Saved preset {name}.")
+        return None
+
+    def save_preset(self) -> None:
+        if self.busy is not None:
+            return
+        typed = simpledialog.askstring("Save preset", "Name for these controls:", parent=self)
+        if typed is None:
+            return
+        name = typed.strip()
+        error = self._preset_name_error(name)
+        if error == "replace":
+            if not messagebox.askyesno(
+                    "Save preset", f"Replace {name} with the controls on screen?", parent=self):
+                return
+            error = self._commit_preset(name, replace=True)
+        elif error is None:
+            error = self._commit_preset(name)
+        if error:
+            messagebox.showerror("Save preset", error, parent=self)
+
+    def _apply_user_preset(self, record: dict[str, object]) -> None:
+        """Apply the factory scene, then the stored controls, then show the name.
+
+        The scene's own defaults run first, which is what a click on that scene
+        does. The stored step, dialogue, post-filter and normalise are written
+        back afterwards so a saved tweak is not immediately replaced. Rumble is
+        restored only for Manual. A named scene still forces it off.
+        """
+        self._applying_preset = True
+        try:
+            normalise_before = bool(self.normalise_var.get())
+            scene_key = str(record["scene"])
+            if scene_key not in SCENES:
+                scene_key = "manual"
+            self.scene_var.set(SCENES[scene_key].label)
+            self._on_scene_change(SCENES[scene_key].label)
+            index = int(record["atten_index"])
+            index = max(0, min(len(ATTEN_STEPS) - 1, index))
+            self.atten_index = index
+            self.atten_slider.set(index)
+            self.lift_var.set(dialogue_menu_label(str(record["dialogue_lift"])))
+            self.postfilter_var.set(bool(record["post_filter"]))
+            self.normalise_var.set(bool(record["normalise"]))
+            if scene_key == "manual":
+                highpass = str(record["highpass"])
+                self.highpass_var.set(highpass if highpass in HIGHPASS_CHOICES else "80 Hz")
+            else:
+                self.highpass_var.set("Off")
+            self.scene_var.set(str(record["name"]))
+            self._on_atten_change(index)
+            if self.denoised48 is not None and bool(self.normalise_var.get()) != normalise_before:
+                self._export_dirty = True
+            self._save_settings()
+            self._refresh_controls()
+        finally:
+            self._applying_preset = False
+        limit = ATTEN_STEPS[self.atten_index]
+        limit_text = "maximum" if limit is None else f"up to {limit} dB"
+        self.log(
+            f"Loaded preset {record['name']}: {SCENES[self._applied_scene].label}, "
+            f"dialogue {self.lift_var.get().lower()}, {limit_text}.")
+
+    def delete_preset(self) -> None:
+        if self.busy is not None:
+            return
+        name = self.scene_var.get()
+        if self._find_preset(name) is None:
+            self.log("Factory scenes stay in the list.")
+            return
+        if not messagebox.askyesno(
+                "Delete preset",
+                f"Delete {name} from the scene list? The controls on screen stay as they are.",
+                parent=self):
+            return
+        self._remove_preset(name)
+
+    def _remove_preset(self, name: str) -> None:
+        """Drop a saved name. The live controls stay, and the menu shows the factory scene."""
+        self._user_presets = [item for item in self._user_presets if item["name"] != name]
+        scene_key = self._applied_scene if self._applied_scene in SCENES else "manual"
+        self._applying_preset = True
+        try:
+            # Set the factory label before the menu values change, so the command
+            # cannot treat a missing name as Manual and replace the live controls.
+            self.scene_var.set(SCENES[scene_key].label)
+            self._rebuild_scene_menu()
+        finally:
+            self._applying_preset = False
+        self._save_settings()
+        self._refresh_controls()
+        self.log(f"Deleted preset {name}. The controls are unchanged.")
+
     def _save_settings(self) -> None:
         scene_key = self._scene_key() if hasattr(self, "scene_var") else "manual"
         data = {
@@ -3037,6 +3323,12 @@ class AudioDeNoiserApp(ctk.CTk):
             for key in ("manual_highpass", "manual_atten_index", "manual_post_filter"):
                 if key in self.settings:
                     data[key] = self.settings[key]
+        presets = getattr(self, "_user_presets", None)
+        if presets is None:
+            presets = clean_user_presets(self.settings.get("user_presets"))
+        data["user_presets"] = [dict(item) for item in presets]
+        data["selected_preset"] = (
+            self._current_preset_name() if hasattr(self, "scene_var") else "")
         self.settings.update(data)
         save_settings(self.settings)
 
@@ -3103,6 +3395,8 @@ class AudioDeNoiserApp(ctk.CTk):
                                   fg_color=C_DANGER if cancellable else C_LINE)
         scene_active = SCENES.get(self._applied_scene, MANUAL).active
         self.scene_menu.configure(state=on(idle))
+        self.save_preset_btn.configure(state=on(idle))
+        self.delete_preset_btn.configure(state=on(idle and self._current_preset_name() != ""))
         self.lift_menu.configure(state=on(idle))
         self.highpass_menu.configure(state=on(idle and not scene_active))
         for widget in (self.atten_slider, self.postfilter_switch,

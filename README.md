@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.5.0-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.6.0-F2A93B)
 
 </div>
 
@@ -25,7 +25,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 
 | Feature | Detail |
 | --- | --- |
-| Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
+| Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum. Save preset… adds the controls on screen to that list under a name you choose |
 | Dialogue lift | Off, Gentle or Clear. Raises consonants a few metres away after the model. Off, the default everywhere except Conversation, leaves the audio untouched |
 | Subtitles | Optional English transcript. Read speech transcribes the buffer you are hearing, without denoising first. The switch transcribes the denoised audio after Denoise, without waiting for a WAV. Words follow the playhead, and Save text writes an SRT and a plain transcript |
 | Save denoised | Denoise keeps the result in memory. Save denoised… writes the WAV when you ask, at the source rate and bit depth. Closing, opening another file, or denoising again asks before an unsaved pass is dropped |
@@ -154,6 +154,7 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| [1.6.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.6.0) | 29 October 2026 | Save preset… adds the controls on screen to the scene list under a name you choose. The denoiser is unchanged |
 | [1.5.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.5.0) | 29 October 2026 | Save denoised… writes the WAV when you ask. Denoise keeps the result in memory. The denoiser is unchanged |
 | [1.4.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.4.0) | 29 October 2026 | Mark a waveform range to loop it, cut it from the session, or save it on its own. Read speech transcribes the buffer you are hearing. The denoiser is unchanged |
 | [1.3.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.3.0) | 28 October 2026 | Conversation (1–5 m), a dialogue lift for talk a few metres away, and optional playback subtitles. Dialogue Off keeps the 1.2.1 sound |

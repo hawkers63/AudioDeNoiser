@@ -6,6 +6,14 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-29
+
+Manual, and every scene shipped in 1.5.0, is unchanged. Denoise still does the same work. A named preset remembers the controls on screen. It does not change the samples. The consonant darkening measured on one outdoor take is not repaired here. That work is scheduled as 1.7.0.
+
+### Added
+
+- **Save preset…** on the scene row stores the controls on screen under a name and adds that name to the Scene menu. Delete removes a saved name. The six factory scenes stay. A preset remembers the scene, dialogue, noise reduction, rumble choice, post-filter and normalise. Choosing it applies the scene first, then those controls, so a change you saved is not replaced by the scene's own defaults. A named scene still forces the rumble filter off. The list is kept in `settings.json`.
+
 ## [1.5.0] - 2026-10-29
 
 Manual, and every scene shipped in 1.4.0, is unchanged. Denoise still does the same work. What changed is when the WAV is written.
@@ -117,7 +125,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...v1.3.0

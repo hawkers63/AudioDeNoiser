@@ -11,5 +11,7 @@
   "manual_atten_index": 9,
   "manual_post_filter": false,
   "dialogue_lift": "off",
-  "subtitles": false
+  "subtitles": false,
+  "user_presets": [],
+  "selected_preset": ""
 }
