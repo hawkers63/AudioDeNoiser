@@ -6,6 +6,27 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 
 ## [Unreleased]
 
+### Planned
+
+- **1.5.0.** Denoise keeps the result in memory. A Save control writes the WAV when you ask, to a name you choose, with the same samples 1.4.0 writes on its own today. Closing the window, opening another file, or running Denoise again asks before an unsaved pass is dropped. The opened file cannot be chosen as the destination.
+
+## [1.4.0] - 2026-10-29
+
+Manual, and every scene shipped in 1.3.0, is unchanged. The tools below edit the session in memory, or write a copy. None of them runs inside `denoise()`.
+
+### Added
+
+- **Shift-drag** on the waveform marks a range of at least 50 ms. A plain click or drag still seeks and leaves the range where it is. Escape clears it. The range is a stippled amber band behind the playhead, with its times on the new button row (`0:12 – 0:40`).
+- **Loop** plays that range until Stop. Starting playback from outside the range jumps to its start. Stop returns to the beginning of the file and leaves the range marked.
+- **Cut** removes the range from this working session. The file on disk is not opened for writing. Each side of the join fades over 2 ms, with no overlap, so the length shrinks by exactly the cut. One **Undo** puts that section back, including any transcript lines. A cut that would leave under a quarter of a second is refused. A later Denoise runs on what remains.
+- **Save selection** writes the marked range of the buffer you are hearing (the denoised audio when B is selected, otherwise the original) to `<name>_selection.wav` in the output folder, then `<name>_selection_2.wav` and so on. It is the source rate and bit depth, including dithered 16-bit. It does not denoise or normalise.
+- **Read speech** transcribes the buffer you are hearing, without a denoise first, in the same 20-second blocks as before, with progress and Cancel. The log names that buffer and says names and street noise will be misspelt. Lines follow the playhead as they arrive. **Save text** is available as soon as one line exists. Beside the denoised WAV when one has been written, otherwise `<name>_transcript.srt` and `<name>_transcript.txt` in the output folder.
+
+### Changed
+
+- The subtitle switch is labelled **English transcript after denoise**. It still reads the denoised audio after Denoise has saved the WAV. The recogniser is unchanged: wav2vec2-base, English read speech, no new package.
+- The window is 860×1020, and the smallest size is 760×996, so the new row, the waveform and the log all remain visible.
+
 ## [1.3.0] - 2026-10-28
 
 Manual, Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street and Subtle Podcast Clean are unchanged when Dialogue is left on Off, which is their default.
@@ -85,7 +106,8 @@ First release of AudioDeNoiser.
 - `AudioDeNoiser.bat` first-run setup of a private Python 3.11 environment and launcher.
 - `settings.example.json`, proprietary `LICENSE` (All Rights Reserved) and full `README.md`.
 
-[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/hawkers63/AudioDeNoiser/compare/v1.1.0...v1.2.0

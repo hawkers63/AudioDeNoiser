@@ -13,6 +13,8 @@ Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
 | 1.2.0 | Transient guard, floor gate, loudness-matched A/B, source bit depth | Released 28 October 2026. Mark's listening check passed 28 October 2026 |
 | 1.2.1 | Faster Heavy Wind and Highway renders, identical output | Released 28 October 2026 |
 | 1.3.0 | Dialogue lift, Conversation (1–5 m), playback subtitles | Released 28 October 2026. Listening check on real 1–5 m speech is still open |
+| 1.4.0 | Waveform range: loop, cut from the session, save the range, read speech | Released 29 October 2026. The denoiser is unchanged |
+| 1.5.0 | Save the denoised audio when asked | Planned. Not started |
 | Later | To be agreed with Mark | Not scheduled |
 
 ## 1.0.0 - Baseline (released)
@@ -103,6 +105,44 @@ Done when:
 - [x] Manual matches 1.1.0 exactly (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three listening clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match on the clips and the 70 s file. The TTS file is 16-bit here and was 24-bit in 1.1, which is the 1.2 export rule.
 - [x] Heavy Wind, Highway, Pedestrian Street and Subtle Podcast Clean, Dialogue Off, match frozen 1.2.0 (the same audio as 1.2.1) on those three clips and the TTS file: 48 kHz buffer and saved file byte-identical, 16 of 16. Conversation rendered on the TTS file without error. That is not a listening check.
 - [ ] Mark's listening check: a real conversation at about 1–5 m, in wind and in traffic, Dialogue Clear against Off, on Conversation and on Highway with the menu set to Clear. Synthetic clips and text-to-speech are not this check.
+
+## 1.4.0 - Waveform range and a transcript you can read (released 29 October 2026)
+
+Design note: `notes/01_Active/006_waveform_selection_and_transcript.md` (local only).
+
+Scope:
+
+- Shift-drag marks a range on the waveform. Click and drag still seek. Escape clears the range.
+- Loop plays that range until Stop. Cut removes it from the working session, with one Undo. The file on disk is not modified.
+- Save selection writes that range alone, at the source rate and bit depth, without denoising it.
+- Read speech transcribes the buffer being heard. The switch is labelled "English transcript after denoise" and still runs after Denoise. Save text no longer waits for a denoised WAV.
+- `denoise()`, the scenes, the dialogue lift and `write_wav` are not edited. Nothing new is installed.
+
+Done when:
+
+- [x] The patch compiles, and the session checks pass with no model: cut length, both channels, cues, undo byte for byte, loop wrap, and a saved selection at the source rate. `notes/tests/session_140.py`, 29 October 2026.
+- [x] Manual still matches 1.1.0 (`notes/tests/integration.py parity`): 48 kHz buffer byte-identical on the three clips, the 70 s file and the TTS clip, at steps 9 and 4. Saved files match except the TTS file, which is 16-bit here and was 24-bit in 1.1. The four released scenes, Dialogue Off, match frozen 1.2.0: 16 of 16, buffer and file. The Hazel transcript smoke passed again (6 of 8 marker words, `kit` heard as `kick`).
+- [x] The window is measured: requested 721×1020. At 860×1020 and at 760×996 the log's last line is visible and the waveform is at least 130 px. The five buttons sit on one row at 760 wide.
+- [x] `CHANGELOG.md` has a 1.4.0 entry, and the commit, `v1.4.0` tag and GitHub Release are published.
+
+## 1.5.0 - Save the denoised audio when asked (planned)
+
+Design note: `notes/01_Active/007_manual_save_denoised.md` (local only). Not started. Booked as 1.5.0 on 29 October 2026, after 1.4.0.
+
+Scope:
+
+- Denoise finishes in memory and does not write a WAV. **Save denoised…** asks for a name and writes the file then.
+- The samples match what 1.4.0 writes on its own: source rate, source bit depth, and peak normalisation only when that switch is on at the moment of saving. Match A/B loudness stays playback-only.
+- Closing the window, opening another file, or running Denoise again asks before an unsaved pass is dropped. The opened file cannot be chosen as the destination.
+- The parity scripts keep writing a file, because they do not pass the new flag. The window does.
+- `denoise()`, the scenes, the dialogue lift and `write_wav` stay as they are. Nothing new is installed.
+
+Done when:
+
+- [ ] The patch is applied and the export of an unchanged pass matches a 1.4.0 file byte for byte.
+- [ ] A denoise from the window leaves no WAV until Save is used.
+- [ ] Manual still matches 1.1.0, and the four released scenes with Dialogue Off still match frozen 1.2.0.
+- [ ] Mark's go-ahead, then `CHANGELOG.md`, the commit, the `v1.5.0` tag and the GitHub Release.
 
 ## Later
 

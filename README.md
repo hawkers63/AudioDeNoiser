@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-B22222)
-![Version](https://img.shields.io/badge/Version-1.3.0-F2A93B)
+![Version](https://img.shields.io/badge/Version-1.4.0-F2A93B)
 
 </div>
 
@@ -27,7 +27,8 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 | --- | --- |
 | Scene presets | Manual keeps the 1.0 chain. Heavy Wind & Gusts, Highway / Traffic Drone, Pedestrian Street, Conversation (1–5 m) and Subtle Podcast Clean precondition each chunk for wind, road rumble, idle tones and hum |
 | Dialogue lift | Off, Gentle or Clear. Raises consonants a few metres away after the model. Off, the default everywhere except Conversation, leaves the audio untouched |
-| Subtitles | Optional. After the file is saved, words from the denoised audio follow the playhead, and Save text writes an SRT and a plain transcript beside the WAV |
+| Subtitles | Optional English transcript. Read speech transcribes the buffer you are hearing, without denoising first. The switch transcribes the denoised audio after Denoise. Words follow the playhead, and Save text writes an SRT and a plain transcript |
+| Waveform range | Shift-drag marks a stretch of the waveform. Loop plays it until Stop. Cut removes it from this session only. Save selection writes that stretch on its own, at the source rate and bit depth |
 | Transient guard | Heavy Wind and Highway repair isolated clicks, ticks and knocks (autoregressive interpolation) and low pops in pauses before the model, which otherwise passes them. Consonant bursts are left alone |
 | Floor gate | Heavy Wind, Highway and Pedestrian Street lower the steady wash the model leaves under its blend limit, by up to 10, 12 or 8 dB, with voiced harmonics protected |
 | Wind and traffic rumble attenuation | On Manual, an optional Butterworth high-pass at 60, 80, 100 or 120 Hz. A named scene replaces that switch with its own low-end stage |
@@ -45,6 +46,7 @@ AudioDeNoiser is a specialised desktop audio restoration tool for Windows 11, bu
 3. Run DeepFilterNet 3 in 30-second chunks, each with a 2-second pre-roll so the model has settled before its output is used, joined with 0.25 s crossfades. After the model, Heavy Wind and Highway soften isolated peaks in the hiss band, and Heavy Wind, Highway, Pedestrian Street and Conversation lower the steady residual floor (the floor gate). If Dialogue is Gentle or Clear, the consonant band is then lifted. All of that happens before the crossfade.
 4. Resample back to the source rate, optionally peak-normalise, and save a WAV named `<name>_denoised.wav` in the output folder, at the source's bit depth (24-bit for MP3 and OGG).
 5. For A/B playback, the integrated loudness of both versions is measured (ITU-R BS.1770-4) and, if **Match A/B loudness** is on, the denoised copy plays at the original's loudness. The saved file is never touched by this.
+6. Shift-drag on the waveform marks a range. Loop repeats it, Cut drops it from the session (the file on disk stays as it was), and Save selection writes that range alone. Read speech transcribes whichever buffer you are hearing.
 
 ## Prerequisites
 
@@ -91,6 +93,8 @@ python audio_denoiser.py [optional audio file]
 | `B` | Audition the denoised version |
 | `Ctrl+O` | Open an audio file |
 | `Ctrl+D` | Denoise the current file |
+| Shift-drag | Mark a range on the waveform |
+| `Escape` | Clear that range |
 
 ## Configuration
 
@@ -125,7 +129,7 @@ Settings are saved automatically to `%APPDATA%\AudioDeNoiser\settings.json`, and
 | `last_dir` | Last folder a file was opened from |
 | `scene` | `manual`, `wind`, `traffic`, `street`, `conversation` or `podcast`. Missing or unknown means Manual |
 | `dialogue_lift` | `off`, `gentle` or `clear`. Missing means the scene's own default (Clear on Conversation, Off on the others) |
-| `subtitles` | Transcribe the denoised audio and show the words during playback. Missing means off |
+| `subtitles` | After Denoise, transcribe the denoised audio and show the words during playback. Missing means off. Read speech is a button, not a saved setting |
 | `manual_highpass` | Rumble choice remembered while a named scene is in use. Default `80 Hz` |
 | `manual_atten_index` | Slider position remembered for the return to Manual. Default `9` (maximum) |
 | `manual_post_filter` | Post-filter switch remembered for the return to Manual. Default `false` |
@@ -149,6 +153,8 @@ Builds and release notes are published on the [Releases page](https://github.com
 
 | Version | Date | Summary |
 | --- | --- | --- |
+| 1.5.0 | Planned | Save the denoised audio when you ask, instead of writing the WAV as soon as Denoise finishes. See [`ROADMAP.md`](ROADMAP.md) |
+| [1.4.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.4.0) | 29 October 2026 | Mark a waveform range to loop it, cut it from the session, or save it on its own. Read speech transcribes the buffer you are hearing. The denoiser is unchanged |
 | [1.3.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.3.0) | 28 October 2026 | Conversation (1–5 m), a dialogue lift for talk a few metres away, and optional playback subtitles. Dialogue Off keeps the 1.2.1 sound |
 | [1.2.1](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.1) | 28 October 2026 | Heavy Wind & Gusts and Highway / Traffic Drone render 11-23 % faster; output byte-identical to 1.2.0 |
 | [1.2.0](https://github.com/hawkers63/AudioDeNoiser/releases/tag/v1.2.0) | 28 October 2026 | Transient guard (click and pop repair), floor gate, loudness-matched A/B and source bit-depth export with dithered 16-bit. Fixes the 1.1.0 buffer-edge spike. Manual matches 1.1 exactly |

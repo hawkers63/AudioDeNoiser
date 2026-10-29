@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio DeNoiser 1.3
+Audio DeNoiser 1.4
 ==================
 
 Copyright (c) 2026-present Mark Hawksworth (hawkers63). All rights reserved.
@@ -20,7 +20,8 @@ Setup    : run AudioDeNoiser.bat once (creates .venv and installs everything),
                 sounddevice==0.5.6 customtkinter==6.0.0
 
 Usage    : python audio_denoiser.py [optional audio file]
-Keys     : Space play/pause, A original, B denoised, Ctrl+O open, Ctrl+D denoise
+Keys     : Space play/pause, A original, B denoised, Ctrl+O open, Ctrl+D denoise,
+           Escape clears a waveform selection
 
 How the processing chain works
 ------------------------------
@@ -39,7 +40,10 @@ How the processing chain works
 4. Resample back to the source rate, optionally peak-normalise, and save a WAV
    named <name>_denoised.wav at the source's bit depth (24-bit for MP3 and OGG).
 5. A/B playback can be loudness-matched (ITU-R BS.1770-4). The file is untouched.
-   With Subtitles on, a local transcript is shown under the waveform and can be saved.
+   Shift-drag on the waveform marks a range: loop it, drop it from this session
+   (the file on disk stays), or save that range on its own. Read speech transcribes
+   the buffer you are hearing. With the transcript switch on, the denoised buffer
+   is transcribed after Denoise. Save text writes an SRT and a plain transcript.
 """
 from __future__ import annotations
 
@@ -89,7 +93,7 @@ except Exception as exc:  # PortAudio missing or no audio subsystem
 #  Configuration
 # --------------------------------------------------------------------------- #
 APP_NAME = "Audio DeNoiser"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 MODEL_SR = 48_000
 SUPPORTED_EXTS = (".wav", ".mp3", ".flac", ".ogg")
@@ -262,6 +266,14 @@ CUE_MAX_S = 6.0
 CUE_GAP_S = 0.8
 CUE_MIN_S = 1.0
 CUE_TAIL_S = 0.2
+
+# A Shift-drag shorter than this is ignored. A cut must leave at least a quarter
+# of a second, which is also the shortest file the loader accepts. The join
+# fades 2 ms on each kept edge and does not overlap, so the length shrinks by
+# exactly the cut and cue times stay exact.
+SELECTION_MIN_S = 0.05
+SELECTION_MIN_KEEP_S = 0.25
+JOIN_FADE_S = 0.002
 
 _SOS_CACHE: dict[tuple, np.ndarray] = {}
 
@@ -2164,6 +2176,155 @@ def write_transcript(path: Path, cues: list[CaptionCue]) -> Path:
     return srt_path
 
 
+def resampled_length(n_frames: int, sr_in: int, sr_out: int) -> int:
+    """Frame count ``resample`` would produce. Matches scipy's ceil(n * up / down)."""
+    if n_frames <= 0 or sr_in <= 0 or sr_out <= 0:
+        raise ValueError("A length needs a positive buffer and sample rate.")
+    if sr_in == sr_out:
+        return int(n_frames)
+    g = gcd(int(sr_in), int(sr_out))
+    up = int(sr_out) // g
+    down = int(sr_in) // g
+    return int(np.ceil(int(n_frames) * up / down))
+
+
+def selection_bounds(
+    origin: float, current: float, n_frames: int, sr: int,
+) -> tuple[int, int] | None:
+    """Sample range for a Shift-drag, or None when it is shorter than 50 ms."""
+    if n_frames <= 0 or sr <= 0:
+        raise ValueError("A selection needs a loaded buffer.")
+    start_f = min(origin, current)
+    end_f = max(origin, current)
+    start = int(round(start_f * n_frames))
+    end = int(round(end_f * n_frames))
+    start = max(0, min(n_frames - 1, start))
+    end = max(start + 1, min(n_frames, end))
+    if (end - start) / sr < SELECTION_MIN_S:
+        return None
+    return start, end
+
+
+def cut_session(audio: np.ndarray, start: int, end: int, sr: int) -> np.ndarray:
+    """Drop [start, end) and fade the join over 2 ms. Length shrinks by exactly the cut.
+
+    The array on disk is not involved. Both kept edges are faded so the splice
+    does not click. The fades do not overlap, so later cue times stay exact.
+    """
+    if audio.ndim != 2:
+        raise ValueError("Session audio is shaped (channels, frames).")
+    n = audio.shape[1]
+    if not (0 <= start < end <= n):
+        raise ValueError(f"Cut {start}:{end} is outside 0:{n}.")
+    if (n - (end - start)) / sr < SELECTION_MIN_KEEP_S:
+        raise ValueError("Cutting that would leave under a quarter of a second.")
+    if not np.isfinite(audio).all():
+        raise ValueError("The session contains invalid samples.")
+    left = np.array(audio[:, :start], dtype=np.float32, copy=True)
+    right = np.array(audio[:, end:], dtype=np.float32, copy=True)
+    fade = min(int(round(JOIN_FADE_S * sr)), left.shape[1], right.shape[1])
+    if fade > 1:
+        ramp = np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        left[:, -fade:] *= ramp
+        right[:, :fade] *= ramp[::-1]
+    return np.ascontiguousarray(np.concatenate([left, right], axis=1), dtype=np.float32)
+
+
+def shift_cues(cues: list[CaptionCue], start_s: float, end_s: float) -> list[CaptionCue]:
+    """Keep lines outside a cut and move later lines earlier. Overlapping lines are dropped."""
+    if end_s <= start_s:
+        raise ValueError("A cut has to have a positive length.")
+    span = end_s - start_s
+    kept: list[CaptionCue] = []
+    for cue in cues:
+        if cue.end_s <= start_s:
+            kept.append(cue)
+        elif cue.start_s >= end_s:
+            kept.append(CaptionCue(cue.start_s - span, cue.end_s - span, cue.text))
+    return kept
+
+
+def fill_looped(
+    dest: np.ndarray, buf: np.ndarray, pos: int, loop: tuple[int, int] | None,
+) -> tuple[int, int, bool]:
+    """Fill ``dest`` along axis 0 from ``buf``. Returns samples written, new position, still playing.
+
+    With no loop, playback runs to the end of ``buf`` and then stops. With a
+    loop, a read that would pass the end wraps to the loop start and playback
+    stays running. ``dest`` and ``buf`` are time-major, as the player stores them.
+    """
+    frames = int(dest.shape[0])
+    n = int(buf.shape[0])
+    if frames <= 0 or n <= 0:
+        return 0, max(0, min(int(pos), n)), False
+    if loop is None:
+        if pos < 0 or pos >= n:
+            return 0, min(max(int(pos), 0), n), False
+        count = min(frames, n - int(pos))
+        dest[:count] = buf[int(pos):int(pos) + count]
+        new_pos = int(pos) + count
+        return count, new_pos, new_pos < n
+    start, end = int(loop[0]), int(loop[1])
+    end = min(end, n)
+    start = max(0, min(start, end - 1))
+    if end <= start:
+        return 0, int(pos), False
+    written = 0
+    position = int(pos)
+    while written < frames:
+        if position < start or position >= end:
+            position = start
+        count = min(frames - written, end - position)
+        if count <= 0:
+            return written, position, False
+        dest[written:written + count] = buf[position:position + count]
+        position += count
+        written += count
+    return written, position, True
+
+
+def selection_output_path(folder: Path, stem: str) -> Path:
+    """First free '<stem>_selection.wav', then _selection_2, and so on."""
+    candidate = folder / f"{stem}_selection.wav"
+    index = 2
+    while candidate.exists():
+        candidate = folder / f"{stem}_selection_{index}.wav"
+        index += 1
+        if index > 10000:
+            raise OSError(f"No free selection name beside {candidate.parent}.")
+    return candidate
+
+
+def save_selection(
+    audio48: np.ndarray, start: int, end: int, source_sr: int,
+    subtype: str, dest: Path,
+) -> Path:
+    """Write one range at the source rate. No denoise and no normalisation."""
+    if audio48.ndim != 2 or not (0 <= start < end <= audio48.shape[1]):
+        raise ValueError("The selection is outside the session.")
+    if source_sr <= 0:
+        raise ValueError("The source sample rate is missing.")
+    piece = np.ascontiguousarray(audio48[:, start:end], dtype=np.float32)
+    if not np.isfinite(piece).all():
+        raise ValueError("The selection contains invalid samples.")
+    if source_sr != MODEL_SR:
+        piece = resample(piece, MODEL_SR, source_sr)
+    if subtype not in EXPORT_SUBTYPES:
+        subtype = "PCM_24"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(".partial.wav")
+    try:
+        write_wav(partial, piece, source_sr, subtype)
+        os.replace(partial, dest)
+    except Exception:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
 # --------------------------------------------------------------------------- #
 #  Playback: in-memory buffers, instant A/B switching at the same position
 # --------------------------------------------------------------------------- #
@@ -2185,6 +2346,7 @@ class Player:
         self._pos = 0
         self._playing = False
         self._stream = None
+        self._loop: tuple[int, int] | None = None
 
     @staticmethod
     def _to_stereo(audio: np.ndarray) -> np.ndarray:
@@ -2221,6 +2383,7 @@ class Player:
             self._gains = {"original": 1.0, "denoised": 1.0}
             self._source = "original"
             self._pos = 0
+            self._loop = None
 
     def set_denoised(self, audio: np.ndarray) -> None:
         stereo = self._to_stereo(audio)
@@ -2240,6 +2403,20 @@ class Player:
         with self._lock:
             self._pos = int(max(0.0, min(1.0, fraction)) * self.length)
 
+    def set_loop(self, bounds: tuple[int, int] | None) -> None:
+        """Loop [start, end) at 48 kHz, or clear it. Play outside the range jumps to the start."""
+        with self._lock:
+            self._loop = bounds
+            if bounds is None:
+                return
+            buf = self._buffers.get(self._source)
+            n = 0 if buf is None else len(buf)
+            start, end = bounds
+            end = min(int(end), n)
+            start = max(0, min(int(start), max(end - 1, 0)))
+            if n and (self._pos < start or self._pos >= end):
+                self._pos = start
+
     # Transport --------------------------------------------------------------
     def play(self) -> None:
         if sd is None:
@@ -2248,7 +2425,13 @@ class Player:
             buf = self._buffers.get(self._source)
             if buf is None:
                 return
-            if self._pos >= len(buf):
+            if self._loop is not None:
+                start, end = self._loop
+                end = min(int(end), len(buf))
+                start = max(0, min(int(start), max(end - 1, 0)))
+                if self._pos < start or self._pos >= end:
+                    self._pos = start
+            elif self._pos >= len(buf):
                 self._pos = 0
             self._playing = True
         if self._stream is None:
@@ -2292,35 +2475,41 @@ class Player:
             if not self._playing or buf is None:
                 outdata.fill(0)
                 return
-            end = min(self._pos + frames, len(buf))
-            count = end - self._pos
-            outdata[:count] = buf[self._pos:end]
+            written, self._pos, self._playing = fill_looped(
+                outdata, buf, self._pos, self._loop)
             gain = self._gains[self._source]
-            if gain != 1.0:
-                outdata[:count] *= gain
-            if count < frames:
-                outdata[count:] = 0
-            self._pos = end
-            if end >= len(buf):
-                self._playing = False
+            if gain != 1.0 and written:
+                outdata[:written] *= gain
+            if written < frames:
+                outdata[written:] = 0
 
 
 # --------------------------------------------------------------------------- #
 #  Waveform view
 # --------------------------------------------------------------------------- #
 class WaveformView(tk.Canvas):
-    """Original in concrete grey, denoised in amber on top. Click or drag to seek."""
+    """Original in concrete grey, denoised in amber on top.
 
-    def __init__(self, master, on_seek, **kwargs):
+    A plain click or drag seeks and leaves any selection where it is.
+    Shift-drag replaces the selection. The rectangle is stippled amber,
+    drawn behind the white playhead.
+    """
+
+    def __init__(self, master, on_seek, on_select=None, **kwargs):
         super().__init__(master, bg=C_PANEL, highlightthickness=0, bd=0, **kwargs)
         self._on_seek = on_seek
+        self._on_select = on_select
         self._orig = None
         self._den = None
         self._playhead = None
+        self._sel: tuple[float, float] | None = None
+        self._sel_item = None
         self._fraction = 0.0
+        self._shift_drag = False
+        self._origin = 0.0
         self.bind("<Configure>", lambda _e: self.redraw())
-        self.bind("<Button-1>", self._seek_event)
-        self.bind("<B1-Motion>", self._seek_event)
+        self.bind("<Button-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
 
     def set_data(self, original, denoised=None) -> None:
         self._orig, self._den = original, denoised
@@ -2335,13 +2524,38 @@ class WaveformView(tk.Canvas):
             x = fraction * self.winfo_width()
             self.coords(self._playhead, x, 0, x, self.winfo_height())
 
+    def set_selection(self, start: float | None, end: float | None) -> None:
+        """Mark a range as fractions of the width, or clear it with None."""
+        if start is None or end is None:
+            self._sel = None
+        else:
+            self._sel = (min(float(start), float(end)), max(float(start), float(end)))
+        self._paint_selection()
+
     def _seek_event(self, event) -> None:
         if self._orig is not None and self.winfo_width() > 0:
             self._on_seek(event.x / self.winfo_width())
 
+    def _press(self, event) -> None:
+        self._shift_drag = bool(event.state & 0x0001)
+        width = self.winfo_width()
+        self._origin = 0.0 if width <= 0 else event.x / width
+        if not self._shift_drag:
+            self._seek_event(event)
+
+    def _drag(self, event) -> None:
+        if self._shift_drag:
+            width = self.winfo_width()
+            if self._orig is not None and self._on_select is not None and width > 0:
+                current = min(1.0, max(0.0, event.x / width))
+                self._on_select(self._origin, current)
+            return
+        self._seek_event(event)
+
     def redraw(self) -> None:
         self.delete("all")
         self._playhead = None
+        self._sel_item = None
         w, h = self.winfo_width(), self.winfo_height()
         if w < 10 or h < 10:
             return
@@ -2361,8 +2575,30 @@ class WaveformView(tk.Canvas):
                              font=(FONT_FAMILY, 9))
             self.create_text(70, 10, anchor="nw", text="Denoised", fill=C_AMBER,
                              font=(FONT_FAMILY, 9))
+        self._sel_item = None
+        self._draw_selection_item(w, h)
         x = self._fraction * w
         self._playhead = self.create_line(x, 0, x, h, fill=C_TEXT, width=2)
+
+    def _draw_selection_item(self, w: int, h: int) -> None:
+        if self._sel is None:
+            return
+        x0 = self._sel[0] * w
+        x1 = self._sel[1] * w
+        self._sel_item = self.create_rectangle(
+            x0, 0, x1, h, outline="", fill=C_AMBER, stipple="gray50")
+
+    def _paint_selection(self) -> None:
+        """Replace the selection rectangle without redrawing the waveform."""
+        if self._sel_item is not None:
+            self.delete(self._sel_item)
+            self._sel_item = None
+        w, h = self.winfo_width(), self.winfo_height()
+        if self._sel is None or self._orig is None or w < 10 or h < 10:
+            return
+        self._draw_selection_item(w, h)
+        if self._playhead is not None:
+            self.tag_raise(self._playhead)
 
     def _polygon(self, env, colour, w, mid, scale) -> None:
         lo, hi = env
@@ -2382,8 +2618,8 @@ class AudioDeNoiserApp(ctk.CTk):
     def __init__(self, initial_file: str | None = None) -> None:
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("860x978")
-        self.minsize(760, 954)  # measured: any shorter and the log box loses its last line
+        self.geometry("860x1020")
+        self.minsize(760, 996)  # measured: any shorter and the waveform drops below 130 px
         self.configure(fg_color=C_BG)
 
         self.settings = load_settings()
@@ -2400,15 +2636,19 @@ class AudioDeNoiserApp(ctk.CTk):
         self.source_sr: int | None = None
         self.source_frames = 0
         self.audio48: np.ndarray | None = None
+        self.denoised48: np.ndarray | None = None
         self.orig_env = None
         self.output_path: str | None = None
         self.source_subtype: str | None = None  # None: no bit depth to keep, save 24-bit
         self.original_lufs = float("-inf")
         self.denoised_lufs = float("-inf")
         self.denoised_peak = 0.0
-        self.busy: str | None = None  # None, "load", "denoise" or "captions"
+        self.busy: str | None = None  # None, "load", "denoise", "captions" or "selection"
         self._last_time_text = ""
         self._pending_file = initial_file
+        self._selection: tuple[int, int] | None = None
+        self._loop_on = False
+        self._undo: dict | None = None
         self._cues: list[CaptionCue] = []
         self._cue_text = ""
         self._caption_warned = False
@@ -2473,7 +2713,8 @@ class AudioDeNoiserApp(ctk.CTk):
         wave_frame.grid_propagate(False)
         wave_frame.grid_columnconfigure(0, weight=1)
         wave_frame.grid_rowconfigure(0, weight=1)
-        self.waveform = WaveformView(wave_frame, on_seek=self._seek)
+        self.waveform = WaveformView(wave_frame, on_seek=self._seek,
+                                     on_select=self._on_waveform_select)
         self.waveform.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
         # Subtitles --------------------------------------------------------
@@ -2488,9 +2729,27 @@ class AudioDeNoiserApp(ctk.CTk):
         self.save_text_btn = self._secondary_button(sub_bar, "Save text", self.save_transcript, 100)
         self.save_text_btn.grid(row=0, column=1, padx=(0, 12), pady=6)
 
+        # Selection --------------------------------------------------------
+        tools = ctk.CTkFrame(self, fg_color="transparent")
+        tools.grid(row=4, column=0, sticky="ew", pady=(0, 8), **pad)
+        tools.grid_columnconfigure(5, weight=1)
+        self.loop_btn = self._secondary_button(tools, "Loop", self.toggle_loop, 72)
+        self.loop_btn.grid(row=0, column=0, padx=(0, 6))
+        self.cut_btn = self._secondary_button(tools, "Cut", self.cut_selection, 64)
+        self.cut_btn.grid(row=0, column=1, padx=(0, 6))
+        self.undo_btn = self._secondary_button(tools, "Undo", self.undo_cut, 72)
+        self.undo_btn.grid(row=0, column=2, padx=(0, 6))
+        self.save_sel_btn = self._secondary_button(tools, "Save selection", self.save_range, 128)
+        self.save_sel_btn.grid(row=0, column=3, padx=(0, 6))
+        self.read_btn = self._secondary_button(tools, "Read speech", self.read_speech, 118)
+        self.read_btn.grid(row=0, column=4, padx=(0, 6))
+        self.range_label = ctk.CTkLabel(tools, text="", anchor="e", font=self._font(13),
+                                        text_color=C_MUTED)
+        self.range_label.grid(row=0, column=5, sticky="e")
+
         # Transport --------------------------------------------------------
         transport = ctk.CTkFrame(self, fg_color="transparent")
-        transport.grid(row=4, column=0, sticky="ew", pady=(0, 10), **pad)
+        transport.grid(row=5, column=0, sticky="ew", pady=(0, 10), **pad)
         transport.grid_columnconfigure(5, weight=1)
         self.play_btn = self._secondary_button(transport, "Play", self.toggle_play, 90)
         self.play_btn.grid(row=0, column=0, padx=(0, 6))
@@ -2515,7 +2774,7 @@ class AudioDeNoiserApp(ctk.CTk):
 
         # Settings ---------------------------------------------------------
         panel = ctk.CTkFrame(self, fg_color=C_PANEL, corner_radius=10)
-        panel.grid(row=5, column=0, sticky="ew", pady=(0, 10), **pad)
+        panel.grid(row=6, column=0, sticky="ew", pady=(0, 10), **pad)
         panel.grid_columnconfigure(1, weight=1)
         label_opts = {"font": self._font(13), "text_color": C_TEXT, "anchor": "w"}
         hint_opts = {"font": self._font(12), "text_color": C_MUTED, "anchor": "w"}
@@ -2593,7 +2852,7 @@ class AudioDeNoiserApp(ctk.CTk):
         self.normalise_switch.grid(row=0, column=1, sticky="w")
         self.subtitles_var = ctk.BooleanVar(value=bool(self.settings.get("subtitles", False)))
         self.subtitles_switch = ctk.CTkSwitch(
-            switches, text="Subtitles while playing", variable=self.subtitles_var,
+            switches, text="English transcript after denoise", variable=self.subtitles_var,
             font=self._font(13), text_color=C_TEXT, progress_color=C_AMBER,
             command=self._save_settings)
         self.subtitles_switch.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
@@ -2611,7 +2870,7 @@ class AudioDeNoiserApp(ctk.CTk):
 
         # Action row -------------------------------------------------------
         action = ctk.CTkFrame(self, fg_color="transparent")
-        action.grid(row=6, column=0, sticky="ew", pady=(0, 8), **pad)
+        action.grid(row=7, column=0, sticky="ew", pady=(0, 8), **pad)
         action.grid_columnconfigure(0, weight=1)
         self.denoise_btn = ctk.CTkButton(action, text="Denoise", command=self.start_denoise,
                                          height=44, font=self._font(16, "bold"),
@@ -2637,7 +2896,7 @@ class AudioDeNoiserApp(ctk.CTk):
         # Log --------------------------------------------------------------
         self.log_box = ctk.CTkTextbox(self, height=92, fg_color=C_PANEL, text_color=C_TEXT,
                                       font=self._font(12), corner_radius=10, wrap="word")
-        self.log_box.grid(row=7, column=0, sticky="ew", pady=(0, 16), **pad)
+        self.log_box.grid(row=8, column=0, sticky="ew", pady=(0, 16), **pad)
         self.log_box.configure(state="disabled")
 
         self._on_atten_change(self.atten_index)
@@ -2645,6 +2904,7 @@ class AudioDeNoiserApp(ctk.CTk):
 
     def _bind_keys(self) -> None:
         self.bind("<space>", lambda _e: self.toggle_play())
+        self.bind("<Escape>", lambda _e: self.clear_selection())
         self.bind("<Control-o>", lambda _e: self.open_file())
         self.bind("<Control-d>", lambda _e: self.start_denoise())
         for key, source in (("a", "original"), ("A", "original"), ("b", "denoised"), ("B", "denoised")):
@@ -2787,7 +3047,14 @@ class AudioDeNoiserApp(ctk.CTk):
         for widget in (self.atten_slider, self.postfilter_switch,
                        self.normalise_switch, self.subtitles_switch, self.change_btn):
             widget.configure(state=on(idle))
-        self.save_text_btn.configure(state=on(bool(self._cues) and bool(self.output_path)))
+        self.save_text_btn.configure(state=on(bool(self._cues) and self.transcript_path() is not None))
+        has_sel = self._selection is not None
+        self.loop_btn.configure(state=on(has_sel))
+        self.cut_btn.configure(state=on(idle and has_sel))
+        self.undo_btn.configure(state=on(idle and self._undo is not None))
+        self.save_sel_btn.configure(state=on(idle and has_sel))
+        self.read_btn.configure(state=on(idle and has_file and self.model is not None))
+        self._style_loop_button()
         can_play = has_file and sd is not None
         self.play_btn.configure(state=on(can_play))
         self.stop_btn.configure(state=on(can_play))
@@ -2801,6 +3068,242 @@ class AudioDeNoiserApp(ctk.CTk):
             button.configure(fg_color=C_AMBER if selected else C_LINE,
                              hover_color=C_AMBER_HOVER if selected else C_LINE_HOVER,
                              text_color=C_ON_AMBER if selected else C_TEXT)
+
+    def _style_loop_button(self) -> None:
+        active = self._loop_on and self._selection is not None
+        self.loop_btn.configure(fg_color=C_AMBER if active else C_LINE,
+                                hover_color=C_AMBER_HOVER if active else C_LINE_HOVER,
+                                text_color=C_ON_AMBER if active else C_TEXT)
+
+    def transcript_path(self) -> Path | None:
+        """Where Save text writes. Beside the denoised WAV, or else the output folder.
+
+        The ``.wav`` suffix only chooses the stem. ``write_transcript`` swaps it
+        for ``.srt`` and ``.txt`` and does not create that wav.
+        """
+        if self.output_path:
+            return Path(self.output_path)
+        if self.source_path is None:
+            return None
+        return self.output_dir / f"{Path(self.source_path).stem}_transcript.wav"
+
+    def _show_range(self) -> None:
+        if self._selection is None or self.audio48 is None:
+            self.range_label.configure(text="")
+            self.waveform.set_selection(None, None)
+            return
+        start, end = self._selection
+        n = max(1, self.audio48.shape[1])
+        self.range_label.configure(
+            text=f"{format_time(start / MODEL_SR)} – {format_time(end / MODEL_SR)}")
+        self.waveform.set_selection(start / n, end / n)
+
+    def _on_waveform_select(self, origin: float, current: float) -> None:
+        if self.audio48 is None:
+            return
+        bounds = selection_bounds(origin, current, self.audio48.shape[1], MODEL_SR)
+        if bounds is None:
+            return
+        had = self._selection is not None
+        self._selection = bounds
+        if self._loop_on:
+            self.player.set_loop(bounds)
+        self._show_range()
+        if not had:
+            self._refresh_controls()
+
+    def clear_selection(self) -> None:
+        if self._selection is None:
+            return
+        self._selection = None
+        self._loop_on = False
+        self.player.set_loop(None)
+        self._show_range()
+        self._refresh_controls()
+
+    def toggle_loop(self) -> None:
+        if self._selection is None:
+            return
+        self._loop_on = not self._loop_on
+        self.player.set_loop(self._selection if self._loop_on else None)
+        if self._loop_on:
+            start, end = self._selection
+            self.log(f"Looping {format_time(start / MODEL_SR)}–"
+                     f"{format_time(end / MODEL_SR)} until Stop.")
+        else:
+            self.log("Loop off. The selection is still marked.")
+        self._refresh_controls()
+
+    def _heard(self) -> tuple[np.ndarray | None, str]:
+        """The buffer Play is using, and a short name for the log."""
+        if self.player.source == "denoised" and self.denoised48 is not None:
+            return self.denoised48, "the denoised audio"
+        return self.audio48, "the original"
+
+    def _playhead_after_cut(self, playhead: int, start: int, end: int, n_new: int) -> int:
+        """Keep the playhead on the same kept sample. Inside the cut, it sits on the join."""
+        if playhead >= end:
+            playhead = playhead - (end - start)
+        else:
+            playhead = min(playhead, start)
+        if n_new <= 0:
+            return 0
+        return max(0, min(playhead, n_new - 1))
+
+    def _remeasure_loudness(self) -> None:
+        if self.audio48 is None:
+            return
+        self.original_lufs = integrated_loudness(self.audio48, MODEL_SR)
+        if self.denoised48 is not None and self.denoised48.size:
+            self.denoised_lufs = integrated_loudness(self.denoised48, MODEL_SR)
+            self.denoised_peak = float(np.max(np.abs(self.denoised48)))
+        else:
+            self.denoised_lufs = float("-inf")
+            self.denoised_peak = 0.0
+
+    def _reload_session(self, playhead: int, source: str) -> None:
+        """Point the player and the waveform at the current session arrays."""
+        if self.audio48 is None:
+            return
+        self.player.load_original(self.audio48)
+        if self.denoised48 is not None:
+            self.player.set_denoised(self.denoised48)
+            if source == "denoised":
+                self.player.set_source("denoised")
+        n = self.audio48.shape[1]
+        playhead = max(0, min(playhead, max(n - 1, 0)))
+        if n:
+            self.player.seek(playhead / n)
+        if self._loop_on and self._selection is not None:
+            self.player.set_loop(self._selection)
+        else:
+            self._loop_on = False
+            self.player.set_loop(None)
+        if n:
+            playhead = self.player.position
+        self.orig_env = waveform_envelope(self.audio48)
+        den_env = waveform_envelope(self.denoised48) if self.denoised48 is not None else None
+        self._show_range()
+        self.waveform.set_data(self.orig_env, den_env)
+        self.waveform.set_playhead(0.0 if n == 0 else playhead / n)
+        self._apply_playback_gains(announce=False)
+
+    def cut_selection(self) -> None:
+        """Remove the marked range from this session. The file on disk is not opened."""
+        if self.busy or self.audio48 is None or self._selection is None:
+            return
+        start, end = self._selection
+        n = self.audio48.shape[1]
+        if self.denoised48 is not None and self.denoised48.shape[1] != n:
+            self.log("The denoised audio does not match this session, so the cut was left as it is.")
+            return
+        try:
+            new_audio = cut_session(self.audio48, start, end, MODEL_SR)
+            new_den = None
+            if self.denoised48 is not None:
+                new_den = cut_session(self.denoised48, start, end, MODEL_SR)
+        except ValueError as exc:
+            self.log(str(exc))
+            return
+        playhead = self.player.position
+        source = self.player.source
+        self._undo = {
+            "audio48": self.audio48,
+            "denoised48": self.denoised48,
+            "cues": list(self._cues),
+            "playhead": playhead,
+            "selection": self._selection,
+            "source_frames": self.source_frames,
+            "original_lufs": self.original_lufs,
+            "denoised_lufs": self.denoised_lufs,
+            "denoised_peak": self.denoised_peak,
+            "output_path": self.output_path,
+            "source": source,
+            "loop_on": self._loop_on,
+        }
+        self.audio48 = new_audio
+        self.denoised48 = new_den
+        self._cues = shift_cues(self._cues, start / MODEL_SR, end / MODEL_SR)
+        self._cue_text = ""
+        self.subtitle_label.configure(text="")
+        self.output_path = None
+        if self.source_sr:
+            self.source_frames = resampled_length(new_audio.shape[1], MODEL_SR, self.source_sr)
+        self._selection = None
+        self._loop_on = False
+        new_pos = self._playhead_after_cut(playhead, start, end, new_audio.shape[1])
+        self._remeasure_loudness()
+        self._reload_session(new_pos, source)
+        span_s = (end - start) / MODEL_SR
+        self.log(f"Removed {format_time(start / MODEL_SR)}–{format_time(end / MODEL_SR)} "
+                 f"from this session ({span_s:.0f} s). The file on disk is unchanged.")
+        self._refresh_controls()
+
+    def undo_cut(self) -> None:
+        if self.busy or self._undo is None:
+            return
+        snap = self._undo
+        self._undo = None
+        self.audio48 = snap["audio48"]
+        self.denoised48 = snap["denoised48"]
+        self._cues = list(snap["cues"])
+        self._cue_text = ""
+        self.subtitle_label.configure(text="")
+        self._selection = snap["selection"]
+        self.source_frames = snap["source_frames"]
+        self.original_lufs = snap["original_lufs"]
+        self.denoised_lufs = snap["denoised_lufs"]
+        self.denoised_peak = snap["denoised_peak"]
+        self.output_path = snap["output_path"]
+        self._loop_on = bool(snap.get("loop_on")) and self._selection is not None
+        self._reload_session(int(snap["playhead"]), str(snap.get("source", "original")))
+        self.log("Restored the removed section.")
+        self._refresh_controls()
+
+    def save_range(self) -> None:
+        """Write the marked range of the buffer being heard. No denoise and no normalisation."""
+        if self.busy or self._selection is None or self.source_path is None or not self.source_sr:
+            return
+        audio, which = self._heard()
+        if audio is None:
+            return
+        start, end = self._selection
+        if end > audio.shape[1]:
+            self.log("The selection is outside this session, so nothing was written.")
+            return
+        try:
+            dest = selection_output_path(self.output_dir, Path(self.source_path).stem)
+        except OSError as exc:
+            self.log(f"Couldn't save the selection: {exc}")
+            return
+        subtype = self.source_subtype or "PCM_24"
+        seconds = (end - start) / MODEL_SR
+        self.progress.set(0)
+        self.progress_label.configure(text="")
+        self._run_job("selection", self._job_save_selection, audio, start, end,
+                      self.source_sr, subtype, dest, which, seconds)
+
+    def _job_save_selection(self, audio, start, end, source_sr, subtype, dest, which, seconds) -> None:
+        used = subtype if subtype in EXPORT_SUBTYPES else "PCM_24"
+        path = save_selection(audio, start, end, source_sr, used, dest)
+        self.events.put(("selection_saved", {
+            "path": str(path), "which": which, "seconds": seconds, "subtype": used}))
+
+    def read_speech(self) -> None:
+        """Transcribe the buffer being heard. Play does not start this."""
+        if self.busy or self.audio48 is None or self.model is None:
+            return
+        audio, which = self._heard()
+        if audio is None:
+            return
+        self.log(f"English transcript of {which}. A read-speech model: "
+                 "names and street noise will be misspelt.")
+        self._caption_warned = True
+        self.cancel_event.clear()
+        self.progress.set(0)
+        self.progress_label.configure(text="0%")
+        target = self.transcript_path()
+        self._run_job("captions", self._job_captions, audio, str(target or ""))
 
     def _update_transport(self) -> None:
         playing = self.player.is_playing
@@ -2838,10 +3341,11 @@ class AudioDeNoiserApp(ctk.CTk):
         self.subtitle_label.configure(text=text)
 
     def save_transcript(self) -> None:
-        if not self._cues or not self.output_path:
+        target = self.transcript_path()
+        if not self._cues or target is None:
             return
         try:
-            srt_path = write_transcript(Path(self.output_path), self._cues)
+            srt_path = write_transcript(target, self._cues)
         except OSError as exc:
             self.log(f"Couldn't save the transcript: {exc}")
             return
@@ -3059,7 +3563,7 @@ class AudioDeNoiserApp(ctk.CTk):
                               "subtitles": bool(opts.get("subtitles", False))}))
 
     def _job_captions(self, den48: np.ndarray, wav_path: str) -> None:
-        """Recognise the denoised audio in 20 s blocks. The wav is already saved."""
+        """Recognise one buffer in 20 s blocks. ``wav_path`` only names the transcript."""
         import torch
         from torchaudio.pipelines import WAV2VEC2_ASR_BASE_960H
 
@@ -3147,14 +3651,20 @@ class AudioDeNoiserApp(ctk.CTk):
         self.source_path, self.source_sr = info["path"], info["sr"]
         self.source_frames = info["frames"]
         self.audio48, self.orig_env = info["audio48"], info["env"]
+        self.denoised48 = None
+        self._selection = None
+        self._loop_on = False
+        self._undo = None
         self.output_path = None
         self.source_subtype = info["subtype"]
         self.original_lufs = info["lufs"]
         self.denoised_lufs = float("-inf")
         self.denoised_peak = 0.0
         self.player.load_original(self.audio48)
+        self.waveform.set_selection(None, None)
         self.waveform.set_data(self.orig_env, None)
         self.waveform.set_playhead(0.0)
+        self.range_label.configure(text="")
         self._cues = []
         self._cue_text = ""
         self.subtitle_label.configure(text="")
@@ -3182,6 +3692,7 @@ class AudioDeNoiserApp(ctk.CTk):
     def _on_denoise_done(self, info: dict) -> None:
         self.busy = None
         self.output_path = info["path"]
+        self.denoised48 = info["den48"]
         self.denoised_lufs = info["lufs"]
         self.denoised_peak = info["peak"]
         self.player.set_denoised(info["den48"])
@@ -3209,6 +3720,9 @@ class AudioDeNoiserApp(ctk.CTk):
         self._cues = []
         self._show_subtitle(0.0)
         if info.get("subtitles"):
+            self.log("English transcript of the denoised audio. A read-speech model: "
+                     "names and street noise will be misspelt.")
+            self._caption_warned = True
             self._run_job("captions", self._job_captions, info["den48"], info["path"])
         else:
             self._refresh_controls()
@@ -3265,10 +3779,18 @@ class AudioDeNoiserApp(ctk.CTk):
         self.progress.set(0)
         self.progress_label.configure(text="")
         if self._cues:
-            self.log("Subtitles stopped. The denoised file is already saved, "
-                     "and Save text will write what was recognised so far.")
+            self.log("Transcript stopped. Save text will write what was recognised so far.")
         else:
-            self.log("Subtitles stopped. The denoised file is already saved.")
+            self.log("Transcript stopped.")
+        self._refresh_controls()
+
+    def _on_selection_saved(self, info: dict) -> None:
+        self.busy = None
+        self.progress.set(1.0)
+        self.progress_label.configure(text="")
+        depth = DEPTH_LABELS.get(info.get("subtype"), "WAV")
+        self.log(f"Saved {info['path']} ({format_time(info['seconds'])} of {info['which']}, "
+                 f"{depth} WAV).")
         self._refresh_controls()
 
     def _on_captions_failed(self, message: str) -> None:
